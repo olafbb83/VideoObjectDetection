@@ -1,0 +1,20 @@
+{
+  "settings_version": "0.0.7",
+  "datasets_dir": "C:\\ESP_dev\\projects\\datasets",
+  "weights_dir": "C:\\ESP_dev\\projects\\VideoDetection\\weights",
+  "runs_dir": "C:\\ESP_dev\\projects\\VideoDetection\\runs",
+  "uuid": "cb993a72804fad1aa643d820c63181970c375f075517b3c0f1932d6c264911bf",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

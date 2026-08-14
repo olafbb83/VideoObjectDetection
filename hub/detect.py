@@ -24,7 +24,8 @@
 Приклади:
   python hub/detect.py
   python hub/detect.py --conf 0.25 --imgsz 320
-  python hub/detect.py --model models/yolo11n_openvino_model --device intel:gpu
+  python hub/detect.py --model models/yolo11n_640_openvino_model --device intel:gpu
+  python hub/detect.py --model models/yolo11n_320_openvino_model --device intel:npu --imgsz 320
   python hub/detect.py --no-window --seconds 30
 """
 
@@ -124,7 +125,10 @@ def main() -> int:
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[detect] завантажую модель {args.model}")
-    model = YOLO(args.model)
+    # У теці OpenVINO немає метаданих про задачу — без явного task ultralytics
+    # лише вгадує її й сипле попередженням
+    is_ov = args.model.rstrip("/\\").endswith("_openvino_model")
+    model = YOLO(args.model, task="detect") if is_ov else YOLO(args.model)
 
     st = probe_status(args.url)
     if st and st.get("clients", 0) > 0:

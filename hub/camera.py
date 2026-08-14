@@ -88,11 +88,13 @@ class MjpegCamera:
         connect_timeout: float = 5.0,
         read_timeout: float = 5.0,
         reconnect_delay: float = 2.0,
+        buffer_size: int = 8192,
     ) -> None:
         self.url = url
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.reconnect_delay = reconnect_delay
+        self.buffer_size = buffer_size
 
         self.stats = CameraStats()
 
@@ -210,7 +212,17 @@ class MjpegCamera:
         """
         # decode_content=False: жодних gzip-перетворень, нам потрібні сирі байти
         resp.raw.decode_content = False
-        stream = io.BufferedReader(resp.raw, buffer_size=65536)
+
+        # Розмір буфера критичний, і не з очевидної причини. Нижній шар
+        # http.client блокується, доки не набере запитану кількість байтів.
+        # З буфером 64 КБ при кадрі ~14 КБ читач чекав ~4.6 кадру, а потім
+        # віддавав їх усі разом: кадри йшли пачками з паузами 200+ мс.
+        # Поки споживач був миттєвий, це не заважало. Але щойно між прийомом
+        # і показом з'явився YOLO (11 мс/кадр), решта пачки почала
+        # перезаписуватись — і 23 fps прийому давали лише 10 fps обробки.
+        # Буфер менший за кадр робить надходження рівномірним (~39 мс), і
+        # пропускна здатність від цього не страждає.
+        stream = io.BufferedReader(resp.raw, buffer_size=self.buffer_size)
 
         fps_window_start = time.monotonic()
         fps_window_frames = 0

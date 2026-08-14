@@ -119,12 +119,17 @@ def main() -> int:
         import shutil
 
         for size in args.imgsz:
-            target = MODELS_DIR / f"yolo11n_ov_{size}"
+            # Назва теки ОБОВ'ЯЗКОВО має закінчуватись на _openvino_model:
+            # ultralytics визначає формат моделі саме за суфіксом назви,
+            # а не за вмістом. Свою частину імені додаємо на початку.
+            target = MODELS_DIR / f"yolo11n_{size}_openvino_model"
             if not target.exists():
                 print(f"[bench] експорт в OpenVINO для imgsz={size}...")
                 exported = Path(YOLO(args.weights).export(format="openvino", imgsz=size))
                 shutil.move(str(exported), str(target))
-            ov_models[size] = YOLO(str(target))
+            # task="detect" обов'язковий: у теці OpenVINO немає метаданих про
+            # задачу, і без підказки ultralytics лише вгадує її з попередженням
+            ov_models[size] = YOLO(str(target), task="detect")
 
     rows = []
     for size in args.imgsz:
