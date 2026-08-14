@@ -1,5 +1,6 @@
 # --- секрети ---
 firmware/**/src/config.h
+secrets/
 
 # --- PlatformIO ---
 .pio/

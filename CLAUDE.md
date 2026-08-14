@@ -54,7 +54,27 @@ C:\Users\Lenovo\.platformio\penv\Scripts\pio.exe run -d firmware/esp32s3_cam -t 
 
 # монітор порту
 C:\Users\Lenovo\.platformio\penv\Scripts\pio.exe device monitor -d firmware/esp32s3_cam
+
+# хаб з детекцією по HTTPS (токен друкується при старті)
+.venv\Scripts\python.exe hub\server.py --model 640 --device intel:gpu
+
+# просто подивитись потік / детекцію локально
+.venv\Scripts\python.exe hub\view.py
+.venv\Scripts\python.exe hub\detect.py --model 640 --device intel:gpu --classes
 ```
+
+## Хаб (етап 4)
+
+- `hub/pipeline.py` — ЄДИНИЙ споживач камери: один читач + один прохід YOLO,
+  глядачі забирають готовий кадр. Не давати кожному HTTP-клієнту свій
+  MjpegCamera: перевірено, 3 глядачі не просідають (19.7/19.9/19.8 fps).
+- `hub/server.py` — FastAPI на HTTPS, порт 8443. Токен обов'язковий скрізь,
+  крім `/health`. Приймається як `Authorization: Bearer` або `?token=`
+  (тег `<img>` не вміє слати заголовки, а MJPEG живе саме в `<img>`).
+- `secrets/` — токен, сертифікат, ключ. У git не потрапляє.
+- Сертифікат самопідписаний (`hub/make_cert.py`). Браузери дивляться **тільки
+  в SAN**, тому адресу треба вписати туди: `--extra <ім'я або IP> --force`.
+  Коли з'явиться домен — просто підмінити файли на Let's Encrypt, код той самий.
 
 ## Конвенції
 
