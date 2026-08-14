@@ -61,10 +61,18 @@ static const char *STREAM_PART_HEADER  = "Content-Type: image/jpeg\r\nContent-Le
 static httpd_handle_t s_web_server    = nullptr;  // порт 80: сторінка, статус, керування
 static httpd_handle_t s_stream_server = nullptr;  // порт 81: тільки потік
 
-// Телеметрія (оновлюється в stream_handler, читається в /status)
-static volatile float  s_fps           = 0.0f;
-static volatile size_t s_last_frame_kb = 0;
-static volatile bool   s_streaming     = false;
+// Телеметрія.
+//
+// Клієнтів стріму може бути кілька одночасно — вони ділять між собою спільну
+// пропускну здатність (виміряно: два клієнти дають 13.3 + 7.4 fps там, де один
+// давав 21). Тому рахувати FPS усередині обробника не можна: кожен екземпляр
+// перезаписував би спільну змінну своїм значенням, і в /status потрапляло б
+// сміття. Замість цього обробники лише інкрементують спільний лічильник кадрів,
+// а сукупний FPS раз на секунду рахує loop().
+static volatile uint32_t s_frames_total  = 0;
+static volatile float    s_fps           = 0.0f;   // сумарно по всіх клієнтах
+static volatile size_t   s_last_frame_kb = 0;
+static volatile int      s_clients       = 0;
 
 // ---------------------------------------------------------------------------
 // Діагностика ребутів
@@ -163,11 +171,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "Connection", "close");
 
-  Serial.println("[stream] клієнт підключився");
-  s_streaming = true;
+  s_clients++;
+  Serial.printf("[stream] клієнт підключився (усього %d)\n", s_clients);
 
   char part_header[64];
-  int64_t prev_us = esp_timer_get_time();
 
   while (true) {
     camera_fb_t *fb = esp_camera_fb_get();
@@ -188,16 +195,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
     if (res != ESP_OK) break;   // клієнт відвалився
 
-    // Експоненційне згладжування FPS, щоб число в /status не стрибало
-    int64_t now_us = esp_timer_get_time();
-    float   inst   = 1000000.0f / (float)(now_us - prev_us);
-    prev_us        = now_us;
-    s_fps          = (s_fps == 0.0f) ? inst : (s_fps * 0.9f + inst * 0.1f);
+    s_frames_total++;           // сукупний FPS порахує loop()
   }
 
-  s_streaming = false;
-  s_fps       = 0.0f;
-  Serial.println("[stream] клієнт відключився");
+  s_clients--;
+  Serial.printf("[stream] клієнт відключився (лишилось %d)\n", s_clients);
   return res;
 }
 
@@ -221,12 +223,12 @@ static esp_err_t status_handler(httpd_req_t *req) {
   snprintf(json, sizeof(json),
            "{\"uptime_s\":%lu,\"reset_reason\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
            "\"heap_free\":%u,\"psram_free\":%u,"
-           "\"streaming\":%s,\"fps\":%.1f,\"frame_kb\":%u,"
+           "\"streaming\":%s,\"clients\":%d,\"fps\":%.1f,\"frame_kb\":%u,"
            "\"framesize\":%d,\"quality\":%d,\"xclk_mhz\":%d}",
            (unsigned long)(millis() / 1000), reset_reason_str(),
            WiFi.RSSI(), WiFi.localIP().toString().c_str(),
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
-           s_streaming ? "true" : "false", s_fps, (unsigned)s_last_frame_kb,
+           s_clients > 0 ? "true" : "false", s_clients, s_fps, (unsigned)s_last_frame_kb,
            s->status.framesize, s->status.quality, XCLK_FREQ_HZ / 1000000);
 
   httpd_resp_set_type(req, "application/json");
@@ -370,7 +372,20 @@ void setup() {
 }
 
 void loop() {
-  // Уся робота — в задачах HTTP-сервера. Тут лише наглядаємо за Wi-Fi.
+  // Сукупний FPS по всіх клієнтах: рахуємо тут, а не в обробнику стріму,
+  // бо обробників може бути кілька і кожен затирав би чуже значення.
+  static uint32_t last_frames = 0;
+  static uint32_t last_ms     = 0;
+
+  uint32_t now_ms = millis();
+  if (last_ms != 0 && now_ms > last_ms) {
+    uint32_t frames = s_frames_total;
+    s_fps = (float)(frames - last_frames) * 1000.0f / (float)(now_ms - last_ms);
+    last_frames = frames;
+  }
+  last_ms = now_ms;
+
+  // Решта роботи — в задачах HTTP-сервера. Тут лише наглядаємо за Wi-Fi.
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[wifi] з'єднання втрачено, перепідключаюсь");
     WiFi.reconnect();

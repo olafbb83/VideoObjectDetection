@@ -81,21 +81,29 @@ def draw_overlay(frame, cam: MjpegCamera, show_fps: float, capturing: bool):
 
 def diagnose(cam: MjpegCamera) -> None:
     """
-    Пояснює, ЧОМУ немає потоку. Найчастіша причина не в мережі:
-    ESP32 віддає потік лише одному клієнту, і його зазвичай тримає
-    відкрита вкладка браузера.
+    Пояснює, ЧОМУ немає потоку — мережа це чи стан самої камери.
     """
     print(f"\n[view] немає потоку: {cam.stats.last_error[:80]}")
 
     st = probe_status(cam.url)
     if st is None:
         print("[view] камера не відповідає і на /status — перевір живлення й Wi-Fi")
-    elif st.get("streaming"):
-        print(f"[view] камера жива (uptime {st.get('uptime_s')} с, {st.get('fps')} fps), "
-              "але потік ЗАЙНЯТИЙ іншим клієнтом.")
-        print("[view] закрий вкладку браузера з відео — ESP32 тримає лише одного глядача")
     else:
-        print(f"[view] камера жива й вільна: {st} — схоже на проблему мережі до порту 81")
+        print(f"[view] камера жива: uptime {st.get('uptime_s')} с, "
+              f"reset {st.get('reset_reason')}, rssi {st.get('rssi')}, "
+              f"clients {st.get('clients')} — схоже на проблему мережі до порту 81")
+
+
+def warn_if_shared(cam: MjpegCamera) -> None:
+    """
+    Попереджає про інших глядачів. Камера обслуговує кількох клієнтів,
+    але вони ділять спільну пропускну здатність: відкрита вкладка браузера
+    вдвічі ріже FPS у цього клієнта.
+    """
+    st = probe_status(cam.url)
+    if st and st.get("clients", 0) > 0:
+        print(f"[view] УВАГА: до потоку вже підключено глядачів: {st['clients']}. "
+              "Вони ділять пропускну здатність — закрий вкладку браузера для повного FPS")
 
 
 def save_frame(frame, reason: str) -> Path:
@@ -120,6 +128,8 @@ def main() -> int:
     print("[view] q — вихід, s — зберегти кадр, c — автозбір, i — накладка")
 
     cam = MjpegCamera(args.url)
+    warn_if_shared(cam)
+
     writer = None
     capturing = args.capture_interval > 0
     show_overlay = True
