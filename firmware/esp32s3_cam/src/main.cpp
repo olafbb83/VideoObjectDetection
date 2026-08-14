@@ -67,6 +67,32 @@ static volatile size_t s_last_frame_kb = 0;
 static volatile bool   s_streaming     = false;
 
 // ---------------------------------------------------------------------------
+// Діагностика ребутів
+//
+// Для системи, що має працювати цілодобово, важливо не просто побачити,
+// що плата перезавантажилась, а знати ЧОМУ. ESP32 зберігає причину скидання
+// між ребутами, і вона одразу розділяє два різні класи проблем:
+//   BROWNOUT       — просадка живлення (слабкий БЖ/кабель) → залізо
+//   PANIC / WDT    — креш або зависання в коді → софт
+//   POWERON / EXT  — нормальний старт або кнопка RST
+// ---------------------------------------------------------------------------
+static const char *reset_reason_str() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "POWERON";
+    case ESP_RST_EXT:      return "EXT_PIN";
+    case ESP_RST_SW:       return "SW_RESTART";
+    case ESP_RST_PANIC:    return "PANIC";        // виняток у коді
+    case ESP_RST_INT_WDT:  return "INT_WDT";      // зависла перервана секція
+    case ESP_RST_TASK_WDT: return "TASK_WDT";     // задача не віддала CPU
+    case ESP_RST_WDT:      return "OTHER_WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";     // просадка живлення
+    case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+    case ESP_RST_SDIO:     return "SDIO";
+    default:               return "UNKNOWN";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Ініціалізація камери
 // ---------------------------------------------------------------------------
 static bool camera_init() {
@@ -193,11 +219,12 @@ static esp_err_t status_handler(httpd_req_t *req) {
   sensor_t *s = esp_camera_sensor_get();
   char json[512];
   snprintf(json, sizeof(json),
-           "{\"uptime_s\":%lu,\"rssi\":%d,\"ip\":\"%s\","
+           "{\"uptime_s\":%lu,\"reset_reason\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
            "\"heap_free\":%u,\"psram_free\":%u,"
            "\"streaming\":%s,\"fps\":%.1f,\"frame_kb\":%u,"
            "\"framesize\":%d,\"quality\":%d,\"xclk_mhz\":%d}",
-           (unsigned long)(millis() / 1000), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+           (unsigned long)(millis() / 1000), reset_reason_str(),
+           WiFi.RSSI(), WiFi.localIP().toString().c_str(),
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
            s_streaming ? "true" : "false", s_fps, (unsigned)s_last_frame_kb,
            s->status.framesize, s->status.quality, XCLK_FREQ_HZ / 1000000);
@@ -318,6 +345,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== VideoDetection / ESP32-S3 CAM ===");
+  Serial.printf("[sys] причина старту: %s\n", reset_reason_str());
   Serial.printf("[sys] flash=%u МБ  psram=%u МБ  cpu=%u МГц\n",
                 ESP.getFlashChipSize() / (1024 * 1024),
                 ESP.getPsramSize() / (1024 * 1024),

@@ -36,6 +36,12 @@ import cv2
 
 from camera import MjpegCamera, probe_status
 
+# cv2.waitKey(1) на Windows коштує НЕ 1 мс, а ~15 мс: він реалізований через
+# системний таймер із гранулярністю 15.6 мс, тож мінімальна пауза — один тік.
+# Це саме по собі опускає стелю показу до ~64 FPS, а на практиці різало
+# нам показ з 22 до 10 FPS. cv2.pollKey() робить те саме без сну (~0.4 мс).
+_poll_key = getattr(cv2, "pollKey", None) or (lambda: cv2.waitKey(1))
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CAPTURES_DIR = PROJECT_ROOT / "captures"
 
@@ -173,7 +179,7 @@ def main() -> int:
                     display = draw_overlay(frame.copy(), cam, show_fps, capturing) if show_overlay else frame
                     cv2.imshow("ESP32-S3 CAM", display)
 
-                    key = cv2.waitKey(1) & 0xFF
+                    key = _poll_key() & 0xFF
                     if key in (ord("q"), 27):
                         break
                     if key == ord("s"):
