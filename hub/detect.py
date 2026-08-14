@@ -21,11 +21,16 @@
 Клас 0 у COCO — це `person`. Модель уміє ще 79 класів, але ми одразу
 фільтруємо, щоб не витрачати час на малювання котів і стільців.
 
+Шлях до моделі можна не писати повністю: `--model 640` розкривається в
+models/yolo11n_640_openvino_model і сам виставляє відповідний imgsz.
+Відносні шляхи рахуються від кореня проекту, а не від поточної теки —
+скрипт можна запускати звідки завгодно.
+
 Приклади:
-  python hub/detect.py
-  python hub/detect.py --conf 0.25 --imgsz 320
-  python hub/detect.py --model models/yolo11n_640_openvino_model --device intel:gpu
-  python hub/detect.py --model models/yolo11n_320_openvino_model --device intel:npu --imgsz 320
+  python hub/detect.py                                  # PyTorch CPU, imgsz 640
+  python hub/detect.py --model 640 --device intel:gpu   # найшвидше
+  python hub/detect.py --model 320 --device intel:npu   # найстабільніше
+  python hub/detect.py --model 640 --device intel:gpu --conf 0.1
   python hub/detect.py --no-window --seconds 30
 """
 
@@ -52,6 +57,28 @@ os.environ.setdefault("YOLO_CONFIG_DIR", str(MODELS_DIR / ".ultralytics"))
 
 BOX_COLOR = (80, 220, 80)
 TEXT_COLOR = (20, 20, 20)
+
+
+def resolve_model(path: str) -> str:
+    """
+    Дозволяє передавати шлях до моделі відносно кореня проекту, а не поточної
+    теки. Інакше `--model models/...` працює тільки якщо запускати скрипт
+    саме з C:\\ESP_dev\\projects\\VideoDetection, що неочевидно і легко забути.
+
+    Також приймає скорочення: `--model 640` -> models/yolo11n_640_openvino_model
+    """
+    if path.isdigit():
+        return str(MODELS_DIR / f"yolo11n_{path}_openvino_model")
+
+    p = Path(path)
+    if p.exists():
+        return str(p)
+
+    candidate = PROJECT_ROOT / path
+    if candidate.exists():
+        return str(candidate)
+
+    return path  # хай ultralytics сам скаже, чого саме не вистачає
 
 
 def draw_detections(frame, boxes) -> int:
@@ -107,12 +134,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Детекція людей у потоці з ESP32-S3 CAM")
     ap.add_argument("--url", default=DEFAULT_URL)
     ap.add_argument("--model", default=str(MODELS_DIR / "yolo11n.pt"),
-                    help="файл ваг .pt або тека *_openvino_model")
+                    help="файл ваг .pt, тека *_openvino_model, "
+                         "або просто розмір входу: 320 / 640")
     ap.add_argument("--device", default=None,
                     help="cpu | intel:cpu | intel:gpu | intel:npu (для OpenVINO)")
     ap.add_argument("--conf", type=float, default=0.35, help="поріг впевненості")
     ap.add_argument("--iou", type=float, default=0.45, help="поріг NMS")
-    ap.add_argument("--imgsz", type=int, default=640, help="розмір входу моделі")
+    ap.add_argument("--imgsz", type=int, default=None,
+                    help="розмір входу моделі (типово 640, або той, під який "
+                         "експортовано модель)")
     ap.add_argument("--classes", type=int, nargs="*", default=[0],
                     help="номери класів COCO (0 = person)")
     ap.add_argument("--save-detections", action="store_true",
@@ -121,14 +151,21 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=0.0)
     args = ap.parse_args()
 
+    # OpenVINO-модель експортується під ФІКСОВАНИЙ розмір входу — граф його
+    # зашиває. Якщо модель задана скороченням (--model 320), imgsz має збігтися,
+    # інакше ultralytics подасть у мережу кадр не того розміру.
+    if args.imgsz is None:
+        args.imgsz = int(args.model) if args.model.isdigit() else 640
+
     from ultralytics import YOLO  # імпорт тут: він важкий, ~3 с
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[detect] завантажую модель {args.model}")
+    model_path = resolve_model(args.model)
+    print(f"[detect] завантажую модель {model_path}")
     # У теці OpenVINO немає метаданих про задачу — без явного task ultralytics
     # лише вгадує її й сипле попередженням
-    is_ov = args.model.rstrip("/\\").endswith("_openvino_model")
-    model = YOLO(args.model, task="detect") if is_ov else YOLO(args.model)
+    is_ov = model_path.rstrip("/\\").endswith("_openvino_model")
+    model = YOLO(model_path, task="detect") if is_ov else YOLO(model_path)
 
     st = probe_status(args.url)
     if st and st.get("clients", 0) > 0:
