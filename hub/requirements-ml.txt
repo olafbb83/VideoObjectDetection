@@ -5,6 +5,9 @@
 torch
 torchvision
 ultralytics          # YOLO11: detect / pose / track (ByteTrack всередині)
+lap                  # розв'язувач задачі про призначення для трекера.
+                     # Без нього model.track() мовчки доставить його сам
+                     # посеред роботи й вимагатиме перезапуску.
 openvino             # прискорення на iGPU Arc та NPU ноутбука
 onnx
 onnxruntime

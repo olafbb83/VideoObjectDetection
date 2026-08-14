@@ -193,6 +193,7 @@ img{width:100%;border-radius:10px;background:#000;display:block}
     <div class=card><div class=k>обробка</div><div class=v id=proc>-</div></div>
     <div class=card><div class=k>інференс</div><div class=v id=inf>-</div></div>
     <div class=card><div class=k>глядачів</div><div class=v id=view>-</div></div>
+    <div class=card><div class=k>треків</div><div class=v id=trk>-</div></div>
   </div>
   <div class=det id=det>—</div>
 </div>
@@ -210,6 +211,7 @@ async function tick(){
     proc.textContent = s.process_fps.toFixed(1) + " fps";
     inf.textContent  = s.infer_ms.toFixed(1) + " ms";
     view.textContent = s.viewers;
+    trk.textContent  = s.tracks_active + " / " + s.tracks_total;
     recv.className = "v" + (s.camera_connected ? "" : " off");
     const d = s.detections || {};
     const keys = Object.keys(d);
@@ -232,19 +234,30 @@ def main() -> int:
     ap.add_argument("--url", default=os.environ.get("CAM_URL", "http://esp32cam.local:81/stream"))
     ap.add_argument("--model", default="640", help="шлях до моделі або 320 / 640")
     ap.add_argument("--device", default=None, help="cpu | intel:gpu | intel:npu")
-    ap.add_argument("--conf", type=float, default=0.35)
+    ap.add_argument("--conf", type=float, default=None,
+                    help="типово 0.35; з --track 0.1 (трекер працює після NMS, "
+                         "тож слабкі детекції треба до нього пропустити)")
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--imgsz", type=int, default=None)
     ap.add_argument("--classes", type=int, nargs="*", default=[0])
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--jpeg-quality", type=int, default=80)
+    ap.add_argument("--track", action="store_true", help="увімкнути трекінг зі стабільними ID")
+    ap.add_argument("--tracker", default="bytetrack.yaml",
+                    choices=["bytetrack.yaml", "botsort.yaml"])
+    ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
     ap.add_argument("--http", action="store_true",
                     help="без TLS (тільки для локальної відладки)")
     args = ap.parse_args()
 
     if args.imgsz is None:
         args.imgsz = int(args.model) if args.model.isdigit() else 640
+
+    # Див. пояснення в detect.py: ByteTrack розрахований на слабкі детекції,
+    # а conf відсікає їх ще до трекера
+    if args.conf is None:
+        args.conf = 0.1 if args.track else 0.35
 
     if not args.http and not (CERT_PATH.exists() and KEY_PATH.exists()):
         print(f"[hub] немає сертифіката {CERT_PATH}")
@@ -267,6 +280,7 @@ def main() -> int:
         classes=args.classes if args.classes else None,
         device=args.device, jpeg_quality=args.jpeg_quality,
         draw_fn=draw_detections, summarize_fn=summarize,
+        track=args.track, tracker=args.tracker, show_trail=not args.no_trail,
     ).start()
 
     scheme = "http" if args.http else "https"

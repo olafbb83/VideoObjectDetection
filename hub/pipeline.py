@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import cv2
 
 from camera import MjpegCamera
+from tracking import TrackHistory, draw_tracks
 
 
 @dataclass
@@ -39,6 +40,8 @@ class PipelineStats:
     viewers: int = 0
     camera_connected: bool = False
     camera_error: str = ""
+    tracks_active: int = 0
+    tracks_total: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -50,6 +53,8 @@ class PipelineStats:
             "viewers": self.viewers,
             "camera_connected": self.camera_connected,
             "camera_error": self.camera_error,
+            "tracks_active": self.tracks_active,
+            "tracks_total": self.tracks_total,
         }
 
 
@@ -73,6 +78,9 @@ class DetectionPipeline:
         jpeg_quality: int = 80,
         draw_fn=None,
         summarize_fn=None,
+        track: bool = False,
+        tracker: str = "bytetrack.yaml",
+        show_trail: bool = True,
     ) -> None:
         self.cam = MjpegCamera(url)
         self.model = model
@@ -85,6 +93,9 @@ class DetectionPipeline:
         self.jpeg_quality = jpeg_quality
         self._draw = draw_fn
         self._summarize = summarize_fn
+        self.tracker = tracker
+        self.show_trail = show_trail
+        self.history = TrackHistory() if track else None
 
         self.stats = PipelineStats()
 
@@ -162,18 +173,27 @@ class DetectionPipeline:
             if frame is None:
                 continue
 
-            r = self.model.predict(
-                frame,
+            common = dict(
                 conf=self.conf,
                 iou=self.iou,
                 imgsz=self.imgsz,
                 classes=self.classes,
                 device=self.device,
                 verbose=False,
-            )[0]
+            )
+
+            if self.history is not None:
+                # persist=True: без нього трекер скидає стан на кожному виклику
+                r = self.model.track(frame, persist=True, tracker=self.tracker, **common)[0]
+                self.history.update(r.boxes, self.names)
+            else:
+                r = self.model.predict(frame, **common)[0]
 
             annotated = frame.copy()
-            if self._draw is not None:
+            if self.history is not None:
+                draw_tracks(annotated, r.boxes, self.names, self.history,
+                            show_trail=self.show_trail)
+            elif self._draw is not None:
                 self._draw(annotated, r.boxes, self.names)
 
             ok, buf = cv2.imencode(".jpg", annotated, encode_params)
@@ -182,6 +202,9 @@ class DetectionPipeline:
 
             self.stats.infer_ms = r.speed.get("inference", 0.0)
             self.stats.frames_processed += 1
+            if self.history is not None:
+                self.stats.tracks_active = self.history.active
+                self.stats.tracks_total = self.history.total_seen
             if self._summarize is not None:
                 counts: dict[str, int] = {}
                 for box in r.boxes:

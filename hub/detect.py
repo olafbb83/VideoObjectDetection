@@ -45,6 +45,7 @@ from pathlib import Path
 import cv2
 
 from camera import MjpegCamera, probe_status
+from tracking import TrackHistory, draw_tracks
 from view import _poll_key, save_frame
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -136,7 +137,7 @@ def summarize(boxes, names) -> str:
     return ", ".join(f"{k} x{v}" for k, v in top)
 
 
-def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz):
+def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz, tracks=None):
     """Накладка: окремо FPS прийому, FPS показу і розклад часу інференсу."""
     pre = speed.get("preprocess", 0.0)
     inf = speed.get("inference", 0.0)
@@ -148,6 +149,10 @@ def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz):
         f"conf {conf}   imgsz {imgsz}",
         summary[:44],
     ]
+    if tracks is not None:
+        # total росте тільки коли з'являється НОВИЙ ID. Якщо він біжить угору
+        # при одній людині в кадрі — трекер губить трек і заводить новий
+        lines.append(f"треків {tracks.active}   унікальних за сеанс {tracks.total_seen}")
 
     pad, line_h, w = 8, 20, 340
     h = pad * 2 + line_h * len(lines)
@@ -170,7 +175,8 @@ def main() -> int:
                          "або просто розмір входу: 320 / 640")
     ap.add_argument("--device", default=None,
                     help="cpu | intel:cpu | intel:gpu | intel:npu (для OpenVINO)")
-    ap.add_argument("--conf", type=float, default=0.35, help="поріг впевненості")
+    ap.add_argument("--conf", type=float, default=None,
+                    help="поріг впевненості (типово 0.35; з --track 0.1, див. нижче)")
     ap.add_argument("--iou", type=float, default=0.45, help="поріг NMS")
     ap.add_argument("--imgsz", type=int, default=None,
                     help="розмір входу моделі (типово 640, або той, під який "
@@ -180,6 +186,13 @@ def main() -> int:
                          "Без значень (--classes) = показувати всі 80")
     ap.add_argument("--list-classes", action="store_true",
                     help="показати всі класи, які модель уміє розпізнавати, і вийти")
+    ap.add_argument("--track", action="store_true",
+                    help="увімкнути трекінг: стабільні ID, хвости траєкторій, час у кадрі")
+    ap.add_argument("--tracker", default="bytetrack.yaml",
+                    choices=["bytetrack.yaml", "botsort.yaml"],
+                    help="bytetrack — легкий і швидкий; botsort — точніший, "
+                         "але важчий (re-ID + компенсація руху камери)")
+    ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
     ap.add_argument("--save-detections", action="store_true",
                     help="зберігати кадри, де знайдено людей, у captures/")
     ap.add_argument("--no-window", action="store_true")
@@ -191,6 +204,19 @@ def main() -> int:
     # інакше ultralytics подасть у мережу кадр не того розміру.
     if args.imgsz is None:
         args.imgsz = int(args.model) if args.model.isdigit() else 640
+
+    # У режимі трекінгу поріг моделі має бути НИЗЬКИМ — і це не помилка.
+    #
+    # Трекінг в ultralytics виконується в on_predict_postprocess_end, тобто
+    # ПІСЛЯ NMS. Усе, що не пройшло conf, трекер не побачить узагалі.
+    # А bytetrack.yaml розрахований саме на слабкі детекції:
+    #   track_high_thresh 0.25 — перший прохід зіставлення
+    #   track_low_thresh  0.10 — другий прохід, порятунок треків
+    # З conf=0.35 вікно 0.10..0.25 порожнє завжди, другий прохід не отримує
+    # нічого, і ByteTrack вироджується у звичайне зіставлення по IoU —
+    # рівно те, заради уникнення чого його й брали.
+    if args.conf is None:
+        args.conf = 0.1 if args.track else 0.35
 
     from ultralytics import YOLO  # імпорт тут: він важкий, ~3 с
 
@@ -220,6 +246,10 @@ def main() -> int:
         print(f"[detect] УВАГА: до потоку вже підключено {st['clients']} глядачів — "
               "вони ділять пропускну здатність")
 
+    history = TrackHistory() if args.track else None
+    if history is not None:
+        print(f"[detect] трекінг: {args.tracker}")
+
     cam = MjpegCamera(args.url)
     show_fps, fps_t0, fps_n = 0.0, time.monotonic(), 0
     last_report, started = 0.0, time.monotonic()
@@ -239,21 +269,25 @@ def main() -> int:
                     continue
 
                 # verbose=False — інакше ultralytics друкує рядок на КОЖЕН кадр
-                results = model.predict(
-                    frame,
-                    conf=args.conf,
-                    iou=args.iou,
-                    imgsz=args.imgsz,
-                    classes=classes,
-                    device=args.device,
-                    verbose=False,
-                )
-                r = results[0]
+                common = dict(conf=args.conf, iou=args.iou, imgsz=args.imgsz,
+                              classes=classes, device=args.device, verbose=False)
+
+                if history is not None:
+                    # persist=True критично: без нього трекер скидає стан на
+                    # кожному виклику, і кожен кадр отримує нові ID з нуля
+                    r = model.track(frame, persist=True, tracker=args.tracker, **common)[0]
+                    history.update(r.boxes, names)
+                else:
+                    r = model.predict(frame, **common)[0]
 
                 # Малюємо по копії: у captures/ мають лежати чисті кадри,
                 # інакше ми навчимо майбутню модель на власних рамках
                 display = frame.copy()
-                n_det = draw_detections(display, r.boxes, names)
+                if history is not None:
+                    n_det = draw_tracks(display, r.boxes, names, history,
+                                        show_trail=not args.no_trail)
+                else:
+                    n_det = draw_detections(display, r.boxes, names)
 
                 infer_ms_sum += r.speed.get("inference", 0.0)
                 infer_n += 1
@@ -268,14 +302,16 @@ def main() -> int:
 
                 if args.no_window:
                     if now - last_report >= 1.0:
+                        extra = (f" | треків {history.active}/{history.total_seen}"
+                                 if history is not None else "")
                         print(f"\rrecv {cam.stats.recv_fps:5.1f} | show {show_fps:5.1f} | "
                               f"infer {r.speed.get('inference', 0):5.1f} ms | "
-                              f"{summarize(r.boxes, names)}", end="", flush=True)
+                              f"{summarize(r.boxes, names)}{extra}", end="", flush=True)
                         last_report = now
                 else:
                     draw_hud(display, recv_fps=cam.stats.recv_fps, show_fps=show_fps,
                              speed=r.speed, summary=summarize(r.boxes, names),
-                             conf=args.conf, imgsz=args.imgsz)
+                             conf=args.conf, imgsz=args.imgsz, tracks=history)
                     cv2.imshow("YOLO — person detection", display)
 
                     key = _poll_key() & 0xFF
