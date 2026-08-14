@@ -1,0 +1,12 @@
+# Етапи 3, 5, 6, 7: детекція, pose, трекінг, навчання, оптимізація.
+# Важке (torch тягне ~2.5 ГБ) — ставимо окремо, коли дійдемо до етапу 3.
+-r requirements.txt
+
+torch
+torchvision
+ultralytics          # YOLO11: detect / pose / track (ByteTrack всередині)
+openvino             # прискорення на iGPU Arc та NPU ноутбука
+onnx
+onnxruntime
+scikit-learn         # класифікатор дій на етапі 6, рівень 2
+matplotlib           # графіки метрик навчання

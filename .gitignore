@@ -1,0 +1,22 @@
+# --- секрети ---
+firmware/**/src/config.h
+
+# --- PlatformIO ---
+.pio/
+.vscode/
+
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- ML-артефакти (важкі, не в git) ---
+models/*.pt
+models/*.onnx
+models/*_openvino_model/
+models/*_ncnn_model/
+runs/
+datasets/
+captures/
+*.mp4
+*.avi

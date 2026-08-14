@@ -1,0 +1,7 @@
+# Етапи 2 і 4: прийом MJPEG, OpenCV, веб-віддача.
+# Легкі пакети, ставляться за секунди.
+numpy
+opencv-python
+requests
+fastapi
+uvicorn[standard]
