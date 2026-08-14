@@ -25,8 +25,8 @@ RPi 5 8GB для фінального цілодобового деплою.
 | 0 | Каркас проекту | git, PlatformIO, venv | ✅ |
 | 1 | Камера стрімить | esp_camera, MJPEG, Wi-Fi | ✅ |
 | 2 | Приймач на Python | OpenCV: захоплення, буферизація, FPS | ✅ |
-| 3 | Перша детекція | YOLO11, COCO, confidence, NMS, OpenVINO | 🔄 |
-| 4 | Стрім результату | FastAPI, MJPEG-віддача, мобільний UI | ⬜ |
+| 3 | Перша детекція | YOLO11, COCO, confidence, NMS, OpenVINO | ✅ |
+| 4 | Стрім результату | FastAPI, MJPEG-віддача, мобільний UI | 🔄 |
 | 5 | Трекінг + поведінка | ByteTrack, pose, зони, події | ⬜ |
 | 6 | Власний датасет і навчання | розмітка, аугментації, mAP, fine-tune | ⬜ |
 | 7 | Деплой на RPi 5 | NCNN/ONNX, INT8-квантизація, systemd | ⬜ |
