@@ -1,0 +1,211 @@
+"""
+Етап 3 — детекція людей у живому потоці з ESP32-S3 CAM.
+
+Три параметри, які визначають майже все, що ти побачиш:
+
+  conf  — поріг впевненості. Модель дає кожній рамці число 0..1, усе нижче
+          порогу відкидається. Нижчий поріг = більше знайдених людей, але й
+          більше хибних спрацювань. Вищий = чисто, але модель губить людей
+          у півоберта, частково перекритих чи далеко.
+
+  iou   — поріг для NMS (Non-Maximum Suppression). Модель видає СОТНІ
+          перекритих рамок на одну людину. NMS лишає найвпевненішу і викидає
+          ті, що перекриваються з нею більше ніж на iou. Дві людини поруч
+          злились в одну рамку — iou замалий. Одна людина обведена трьома
+          рамками — завеликий.
+
+  imgsz — до якого розміру кадр масштабується перед подачею в модель.
+          Найдорожчий параметр: час інференсу росте приблизно квадратично.
+          640 — стандарт, 320 вчетверо швидше, але дрібні фігури зникають.
+
+Клас 0 у COCO — це `person`. Модель уміє ще 79 класів, але ми одразу
+фільтруємо, щоб не витрачати час на малювання котів і стільців.
+
+Приклади:
+  python hub/detect.py
+  python hub/detect.py --conf 0.25 --imgsz 320
+  python hub/detect.py --model models/yolo11n_openvino_model --device intel:gpu
+  python hub/detect.py --no-window --seconds 30
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+import cv2
+
+from camera import MjpegCamera, probe_status
+from view import _poll_key, save_frame
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = PROJECT_ROOT / "models"
+
+DEFAULT_URL = os.environ.get("CAM_URL", "http://esp32cam.local:81/stream")
+
+# Ultralytics качає ваги в поточну теку; хочемо, щоб вони лежали в models/
+os.environ.setdefault("YOLO_CONFIG_DIR", str(MODELS_DIR / ".ultralytics"))
+
+BOX_COLOR = (80, 220, 80)
+TEXT_COLOR = (20, 20, 20)
+
+
+def draw_detections(frame, boxes) -> int:
+    """
+    Малює рамки. Повертає кількість намальованих.
+
+    boxes — це results[0].boxes від ultralytics: .xyxy (координати кутів),
+    .conf (впевненість), .cls (номер класу).
+    """
+    n = 0
+    for box in boxes:
+        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+        conf = float(box.conf[0])
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
+
+        label = f"person {conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        # підкладка під текст, щоб він читався на будь-якому фоні
+        cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 6, y1), BOX_COLOR, -1)
+        cv2.putText(frame, label, (x1 + 3, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 1, cv2.LINE_AA)
+        n += 1
+    return n
+
+
+def draw_hud(frame, *, recv_fps, show_fps, speed, n_det, conf, imgsz):
+    """Накладка: окремо FPS прийому, FPS показу і розклад часу інференсу."""
+    pre = speed.get("preprocess", 0.0)
+    inf = speed.get("inference", 0.0)
+    post = speed.get("postprocess", 0.0)
+
+    lines = [
+        f"recv {recv_fps:5.1f} fps   show {show_fps:5.1f} fps",
+        f"infer {inf:5.1f} ms  (pre {pre:.1f} / post {post:.1f})",
+        f"persons: {n_det}    conf {conf}  imgsz {imgsz}",
+    ]
+
+    pad, line_h, w = 8, 20, 340
+    h = pad * 2 + line_h * len(lines)
+    roi = frame[0:h, 0:w]
+    cv2.rectangle(roi, (0, 0), (w, h), (0, 0, 0), -1)
+    cv2.addWeighted(roi, 0.55, frame[0:h, 0:w], 0.45, 0, frame[0:h, 0:w])
+
+    for i, text in enumerate(lines):
+        y = pad + line_h * (i + 1) - 5
+        cv2.putText(frame, text, (pad, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (230, 230, 230), 1, cv2.LINE_AA)
+    return frame
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Детекція людей у потоці з ESP32-S3 CAM")
+    ap.add_argument("--url", default=DEFAULT_URL)
+    ap.add_argument("--model", default=str(MODELS_DIR / "yolo11n.pt"),
+                    help="файл ваг .pt або тека *_openvino_model")
+    ap.add_argument("--device", default=None,
+                    help="cpu | intel:cpu | intel:gpu | intel:npu (для OpenVINO)")
+    ap.add_argument("--conf", type=float, default=0.35, help="поріг впевненості")
+    ap.add_argument("--iou", type=float, default=0.45, help="поріг NMS")
+    ap.add_argument("--imgsz", type=int, default=640, help="розмір входу моделі")
+    ap.add_argument("--classes", type=int, nargs="*", default=[0],
+                    help="номери класів COCO (0 = person)")
+    ap.add_argument("--save-detections", action="store_true",
+                    help="зберігати кадри, де знайдено людей, у captures/")
+    ap.add_argument("--no-window", action="store_true")
+    ap.add_argument("--seconds", type=float, default=0.0)
+    args = ap.parse_args()
+
+    from ultralytics import YOLO  # імпорт тут: він важкий, ~3 с
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[detect] завантажую модель {args.model}")
+    model = YOLO(args.model)
+
+    st = probe_status(args.url)
+    if st and st.get("clients", 0) > 0:
+        print(f"[detect] УВАГА: до потоку вже підключено {st['clients']} глядачів — "
+              "вони ділять пропускну здатність")
+
+    cam = MjpegCamera(args.url)
+    show_fps, fps_t0, fps_n = 0.0, time.monotonic(), 0
+    last_report, started = 0.0, time.monotonic()
+    infer_ms_sum, infer_n = 0.0, 0
+
+    print("[detect] q — вихід, s — зберегти кадр")
+
+    try:
+        with cam:
+            while True:
+                now = time.monotonic()
+                if args.seconds and now - started >= args.seconds:
+                    break
+
+                frame = cam.read(timeout=1.0)
+                if frame is None:
+                    continue
+
+                # verbose=False — інакше ultralytics друкує рядок на КОЖЕН кадр
+                results = model.predict(
+                    frame,
+                    conf=args.conf,
+                    iou=args.iou,
+                    imgsz=args.imgsz,
+                    classes=args.classes,
+                    device=args.device,
+                    verbose=False,
+                )
+                r = results[0]
+
+                # Малюємо по копії: у captures/ мають лежати чисті кадри,
+                # інакше ми навчимо майбутню модель на власних рамках
+                display = frame.copy()
+                n_det = draw_detections(display, r.boxes)
+
+                infer_ms_sum += r.speed.get("inference", 0.0)
+                infer_n += 1
+
+                if args.save_detections and n_det:
+                    save_frame(frame, f"det{n_det}")
+
+                fps_n += 1
+                if now - fps_t0 >= 1.0:
+                    show_fps = fps_n / (now - fps_t0)
+                    fps_n, fps_t0 = 0, now
+
+                if args.no_window:
+                    if now - last_report >= 1.0:
+                        print(f"\rrecv {cam.stats.recv_fps:5.1f} | show {show_fps:5.1f} | "
+                              f"infer {r.speed.get('inference', 0):5.1f} ms | "
+                              f"persons {n_det}", end="", flush=True)
+                        last_report = now
+                else:
+                    draw_hud(display, recv_fps=cam.stats.recv_fps, show_fps=show_fps,
+                             speed=r.speed, n_det=n_det, conf=args.conf, imgsz=args.imgsz)
+                    cv2.imshow("YOLO — person detection", display)
+
+                    key = _poll_key() & 0xFF
+                    if key in (ord("q"), 27):
+                        break
+                    if key == ord("s"):
+                        print(f"\n[detect] збережено {save_frame(frame, 'manual').name}")
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cv2.destroyAllWindows()
+
+    if infer_n:
+        print(f"\n[detect] середній інференс: {infer_ms_sum / infer_n:.1f} мс "
+              f"({1000 * infer_n / infer_ms_sum:.1f} fps стеля моделі)")
+    print(f"[detect] кадрів прийнято {cam.stats.frames_received}, "
+          f"викинуто {cam.stats.frames_dropped}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
