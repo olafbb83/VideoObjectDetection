@@ -55,8 +55,24 @@ DEFAULT_URL = os.environ.get("CAM_URL", "http://esp32cam.local:81/stream")
 # Ultralytics качає ваги в поточну теку; хочемо, щоб вони лежали в models/
 os.environ.setdefault("YOLO_CONFIG_DIR", str(MODELS_DIR / ".ultralytics"))
 
-BOX_COLOR = (80, 220, 80)
+PERSON_COLOR = (80, 220, 80)
 TEXT_COLOR = (20, 20, 20)
+
+
+def class_color(cls_id: int):
+    """
+    Свій колір кожному класу, щоб у кадрі з різними об'єктами було видно,
+    де що. person лишаємо зеленим — він для нас головний.
+    """
+    if cls_id == 0:
+        return PERSON_COLOR
+    # детермінований розкид по відтінках: той самий клас завжди того ж кольору
+    h = (cls_id * 47) % 180
+    import numpy as np
+
+    hsv = np.uint8([[[h, 200, 240]]])
+    b, g, r = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+    return int(b), int(g), int(r)
 
 
 def resolve_model(path: str) -> str:
@@ -81,31 +97,46 @@ def resolve_model(path: str) -> str:
     return path  # хай ultralytics сам скаже, чого саме не вистачає
 
 
-def draw_detections(frame, boxes) -> int:
+def draw_detections(frame, boxes, names) -> int:
     """
     Малює рамки. Повертає кількість намальованих.
 
     boxes — це results[0].boxes від ultralytics: .xyxy (координати кутів),
     .conf (впевненість), .cls (номер класу).
+    names — словник {номер класу: назва} з самої моделі.
     """
     n = 0
     for box in boxes:
         x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
         conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+        color = class_color(cls_id)
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        label = f"person {conf:.2f}"
+        label = f"{names.get(cls_id, cls_id)} {conf:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         # підкладка під текст, щоб він читався на будь-якому фоні
-        cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 6, y1), BOX_COLOR, -1)
+        cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
         cv2.putText(frame, label, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 1, cv2.LINE_AA)
         n += 1
     return n
 
 
-def draw_hud(frame, *, recv_fps, show_fps, speed, n_det, conf, imgsz):
+def summarize(boxes, names) -> str:
+    """'person x1, chair x2' — що саме зараз у кадрі."""
+    counts: dict[str, int] = {}
+    for box in boxes:
+        name = names.get(int(box.cls[0]), "?")
+        counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return "-"
+    top = sorted(counts.items(), key=lambda kv: -kv[1])[:4]
+    return ", ".join(f"{k} x{v}" for k, v in top)
+
+
+def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz):
     """Накладка: окремо FPS прийому, FPS показу і розклад часу інференсу."""
     pre = speed.get("preprocess", 0.0)
     inf = speed.get("inference", 0.0)
@@ -114,7 +145,8 @@ def draw_hud(frame, *, recv_fps, show_fps, speed, n_det, conf, imgsz):
     lines = [
         f"recv {recv_fps:5.1f} fps   show {show_fps:5.1f} fps",
         f"infer {inf:5.1f} ms  (pre {pre:.1f} / post {post:.1f})",
-        f"persons: {n_det}    conf {conf}  imgsz {imgsz}",
+        f"conf {conf}   imgsz {imgsz}",
+        summary[:44],
     ]
 
     pad, line_h, w = 8, 20, 340
@@ -144,7 +176,10 @@ def main() -> int:
                     help="розмір входу моделі (типово 640, або той, під який "
                          "експортовано модель)")
     ap.add_argument("--classes", type=int, nargs="*", default=[0],
-                    help="номери класів COCO (0 = person)")
+                    help="номери класів COCO (0 = person). "
+                         "Без значень (--classes) = показувати всі 80")
+    ap.add_argument("--list-classes", action="store_true",
+                    help="показати всі класи, які модель уміє розпізнавати, і вийти")
     ap.add_argument("--save-detections", action="store_true",
                     help="зберігати кадри, де знайдено людей, у captures/")
     ap.add_argument("--no-window", action="store_true")
@@ -166,6 +201,19 @@ def main() -> int:
     # лише вгадує її й сипле попередженням
     is_ov = model_path.rstrip("/\\").endswith("_openvino_model")
     model = YOLO(model_path, task="detect") if is_ov else YOLO(model_path)
+    names = model.names
+
+    if args.list_classes:
+        print(f"\nМодель уміє розпізнавати {len(names)} класів:\n")
+        for i in range(0, len(names), 4):
+            row = "  ".join(f"{k:2d} {names[k]:<16s}" for k in range(i, min(i + 4, len(names))))
+            print("  " + row)
+        return 0
+
+    # Порожній список від argparse (--classes без значень) означає "усі класи".
+    # Для ultralytics "усі" — це None, а НЕ порожній список.
+    classes = args.classes if args.classes else None
+    print(f"[detect] класи: {'усі 80' if classes is None else [names[c] for c in classes]}")
 
     st = probe_status(args.url)
     if st and st.get("clients", 0) > 0:
@@ -196,7 +244,7 @@ def main() -> int:
                     conf=args.conf,
                     iou=args.iou,
                     imgsz=args.imgsz,
-                    classes=args.classes,
+                    classes=classes,
                     device=args.device,
                     verbose=False,
                 )
@@ -205,7 +253,7 @@ def main() -> int:
                 # Малюємо по копії: у captures/ мають лежати чисті кадри,
                 # інакше ми навчимо майбутню модель на власних рамках
                 display = frame.copy()
-                n_det = draw_detections(display, r.boxes)
+                n_det = draw_detections(display, r.boxes, names)
 
                 infer_ms_sum += r.speed.get("inference", 0.0)
                 infer_n += 1
@@ -222,11 +270,12 @@ def main() -> int:
                     if now - last_report >= 1.0:
                         print(f"\rrecv {cam.stats.recv_fps:5.1f} | show {show_fps:5.1f} | "
                               f"infer {r.speed.get('inference', 0):5.1f} ms | "
-                              f"persons {n_det}", end="", flush=True)
+                              f"{summarize(r.boxes, names)}", end="", flush=True)
                         last_report = now
                 else:
                     draw_hud(display, recv_fps=cam.stats.recv_fps, show_fps=show_fps,
-                             speed=r.speed, n_det=n_det, conf=args.conf, imgsz=args.imgsz)
+                             speed=r.speed, summary=summarize(r.boxes, names),
+                             conf=args.conf, imgsz=args.imgsz)
                     cv2.imshow("YOLO — person detection", display)
 
                     key = _poll_key() & 0xFF
