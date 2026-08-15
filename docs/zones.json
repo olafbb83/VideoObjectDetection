@@ -1,0 +1,43 @@
+{
+  "zones": [
+    {
+      "name": "бiля столу",
+      "points": [
+        [
+          0.02,
+          0.45
+        ],
+        [
+          0.45,
+          0.45
+        ],
+        [
+          0.45,
+          0.98
+        ],
+        [
+          0.02,
+          0.98
+        ]
+      ],
+      "dwell_alert_s": 5,
+      "anchor": "bottom"
+    }
+  ],
+  "lines": [
+    {
+      "name": "prokhid",
+      "a": [
+        0.55,
+        0.3
+      ],
+      "b": [
+        0.55,
+        0.99
+      ],
+      "positive": "vpravo",
+      "negative": "vlivo",
+      "anchor": "bottom"
+    }
+  ]
+}

@@ -38,6 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from detect import TUNED_TRACKER, draw_detections, resolve_model, summarize
 from pipeline import DetectionPipeline
+from zones import RuleEngine, load_config as load_zones
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SECRETS_DIR = PROJECT_ROOT / "secrets"
@@ -115,6 +116,17 @@ def api_status() -> JSONResponse:
     return JSONResponse(_pipeline.stats.as_dict())
 
 
+@app.get("/api/events", dependencies=[Depends(require_token)])
+def api_events(limit: int = Query(default=50, ge=1, le=200)) -> JSONResponse:
+    """Останні події зон і ліній, найновіші першими."""
+    if _pipeline is None or _pipeline.engine is None:
+        return JSONResponse({"events": [], "note": "правила не увімкнено (--zones)"})
+    evs = list(_pipeline.engine.events)[-limit:]
+    return JSONResponse({
+        "events": [e.as_dict() | {"text": e.human()} for e in reversed(evs)],
+    })
+
+
 @app.get("/snapshot.jpg", dependencies=[Depends(require_token)])
 def snapshot() -> Response:
     if _pipeline is None:
@@ -184,6 +196,15 @@ img{width:100%;border-radius:10px;background:#000;display:block}
 .tag{display:inline-block;background:#2a4d3a;color:#8fe0a8;border-radius:5px;
      padding:2px 8px;margin:2px 4px 2px 0;font-size:13px}
 .off{color:#ff8b8b}
+h2{font-size:13px;font-weight:600;color:#7d8f9f;margin:16px 0 6px;
+   text-transform:uppercase;letter-spacing:.04em}
+.log{list-style:none;margin:0;padding:0;max-height:230px;overflow-y:auto;
+     background:#1a1e22;border-radius:8px}
+.log li{padding:7px 10px;border-bottom:1px solid #23282d;font-size:13px;
+        display:flex;gap:8px;align-items:baseline}
+.log li:last-child{border-bottom:none}
+.log time{color:#6f8296;font-size:11px;flex-shrink:0;font-variant-numeric:tabular-nums}
+.dwell{color:#ffcf6b}.cross{color:#8fd0ff}
 </style>
 <div class=wrap>
   <h1>VideoDetection — ESP32-S3 CAM</h1>
@@ -196,6 +217,9 @@ img{width:100%;border-radius:10px;background:#000;display:block}
     <div class=card><div class=k>треків</div><div class=v id=trk>-</div></div>
   </div>
   <div class=det id=det>—</div>
+  <div class=det id=occ style="display:none"></div>
+  <h2 id=evh style="display:none">Події</h2>
+  <ul id=evs class=log></ul>
 </div>
 <script>
 const token = "__TOKEN__";
@@ -218,9 +242,33 @@ async function tick(){
     det.innerHTML = keys.length
       ? keys.map(k => `<span class=tag>${k} &times;${d[k]}</span>`).join("")
       : "&mdash;";
+
+    const oc = s.occupancy || {}, cn = s.counters || {};
+    const parts = Object.keys(oc).map(k => `<span class=tag>${k}: ${oc[k]}</span>`)
+      .concat(Object.keys(cn).map(k => `<span class=tag>${k} ${cn[k]}</span>`));
+    occ.style.display = parts.length ? "" : "none";
+    occ.innerHTML = parts.join("");
   }catch(e){ det.textContent = "немає зв'язку з хабом"; }
 }
+
+// Події тягнемо окремо: вони змінюються рідко, а /api/status раз на секунду
+async function events(){
+  try{
+    const r = await fetch("/api/events?limit=40" + (q ? "&" + q.slice(1) : ""));
+    if(!r.ok) return;
+    const s = await r.json();
+    if(!s.events.length) return;
+    evh.style.display = "";
+    evs.innerHTML = s.events.map(e => {
+      const cls = e.kind === "zone_dwell" ? "dwell"
+                : e.kind === "line_cross" ? "cross" : "";
+      const t = new Date(e.wall * 1000).toLocaleTimeString("uk-UA");
+      return `<li><time>${t}</time><span class="${cls}">${e.text}</span></li>`;
+    }).join("");
+  }catch(e){}
+}
 setInterval(tick, 1000); tick();
+setInterval(events, 2000); events();
 </script>
 </html>"""
 
@@ -246,9 +294,15 @@ def main() -> int:
     ap.add_argument("--track", action="store_true", help="увімкнути трекінг зі стабільними ID")
     ap.add_argument("--tracker", default=str(TUNED_TRACKER))
     ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
+    ap.add_argument("--zones", nargs="?", const=str(PROJECT_ROOT / "docs" / "zones.json"),
+                    help="JSON із зонами й лініями (типово docs/zones.json)")
     ap.add_argument("--http", action="store_true",
                     help="без TLS (тільки для локальної відладки)")
     args = ap.parse_args()
+
+    # Правила спираються на track_id — без трекінгу вони безглузді
+    if args.zones:
+        args.track = True
 
     if args.imgsz is None:
         args.imgsz = int(args.model) if args.model.isdigit() else 640
@@ -270,6 +324,12 @@ def main() -> int:
     is_ov = model_path.rstrip("/\\").endswith("_openvino_model")
     model = YOLO(model_path, task="detect") if is_ov else YOLO(model_path)
 
+    engine = None
+    if args.zones:
+        zones_cfg, lines_cfg = load_zones(args.zones)
+        engine = RuleEngine(zones_cfg, lines_cfg)
+        print(f"[hub] правила: зон {len(zones_cfg)}, ліній {len(lines_cfg)}")
+
     _pipeline = DetectionPipeline(
         args.url, model,
         conf=args.conf, iou=args.iou, imgsz=args.imgsz,
@@ -277,6 +337,7 @@ def main() -> int:
         device=args.device, jpeg_quality=args.jpeg_quality,
         draw_fn=draw_detections, summarize_fn=summarize,
         track=args.track, tracker=args.tracker, show_trail=not args.no_trail,
+        engine=engine,
     ).start()
 
     scheme = "http" if args.http else "https"

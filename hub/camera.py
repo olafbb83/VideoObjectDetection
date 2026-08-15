@@ -70,6 +70,73 @@ class CameraStats:
         return dict(self.__dict__)
 
 
+class FileSource:
+    """
+    Той самий інтерфейс, що й у MjpegCamera, але кадри беруться з файлу.
+
+    Навіщо: щоб порівнювати налаштування на ІДЕНТИЧНОМУ вході. На живій
+    камері кожен прогін інший, і різниця налаштувань тоне в різниці рухів
+    (саме на це ми наступили при підборі трекера).
+
+    Кадри віддаються з реальною швидкістю запису, а не якнайшвидше:
+    інакше трекер бачив би рух у 10 разів швидшим, ніж він був, і його
+    передбачення розсипались би.
+    """
+
+    def __init__(self, path: str, realtime: bool = True, loop: bool = False) -> None:
+        self.path = path
+        self.realtime = realtime
+        self.loop = loop
+
+        self._cap = cv2.VideoCapture(path)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"не відкривається відео: {path}")
+
+        self.fps = self._cap.get(cv2.CAP_PROP_FPS) or 25.0
+        self.frame_count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.stats = CameraStats(connected=True, recv_fps=self.fps)
+
+        self._index = 0
+        self._t0 = time.monotonic()
+
+    def start(self) -> "FileSource":
+        self._t0 = time.monotonic()
+        return self
+
+    def read(self, timeout: float | None = None) -> np.ndarray | None:
+        if self.realtime:
+            due = self._t0 + self._index / self.fps
+            delay = due - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+
+        ok, frame = self._cap.read()
+        if not ok:
+            if not self.loop:
+                self.stats.connected = False
+                return None
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self._index = 0
+            self._t0 = time.monotonic()
+            ok, frame = self._cap.read()
+            if not ok:
+                return None
+
+        self._index += 1
+        self.stats.frames_received += 1
+        return frame
+
+    def stop(self) -> None:
+        self._cap.release()
+        self.stats.connected = False
+
+    def __enter__(self) -> "FileSource":
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+
 class MjpegCamera:
     """
     Читач MJPEG-потоку з авто-перепідключенням.

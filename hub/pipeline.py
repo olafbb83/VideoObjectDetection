@@ -28,6 +28,7 @@ import cv2
 
 from camera import MjpegCamera
 from tracking import TrackHistory, draw_tracks
+from zones import RuleEngine, draw_overlay as draw_zones
 
 
 @dataclass
@@ -42,6 +43,8 @@ class PipelineStats:
     camera_error: str = ""
     tracks_active: int = 0
     tracks_total: int = 0
+    occupancy: dict[str, int] = field(default_factory=dict)
+    counters: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -55,6 +58,8 @@ class PipelineStats:
             "camera_error": self.camera_error,
             "tracks_active": self.tracks_active,
             "tracks_total": self.tracks_total,
+            "occupancy": self.occupancy,
+            "counters": self.counters,
         }
 
 
@@ -81,6 +86,7 @@ class DetectionPipeline:
         track: bool = False,
         tracker: str = "bytetrack.yaml",
         show_trail: bool = True,
+        engine: RuleEngine | None = None,
     ) -> None:
         self.cam = MjpegCamera(url)
         self.model = model
@@ -96,6 +102,7 @@ class DetectionPipeline:
         self.tracker = tracker
         self.show_trail = show_trail
         self.history = TrackHistory() if track else None
+        self.engine = engine
 
         self.stats = PipelineStats()
 
@@ -189,7 +196,13 @@ class DetectionPipeline:
             else:
                 r = self.model.predict(frame, **common)[0]
 
+            if self.engine is not None:
+                for ev in self.engine.update(r.boxes, frame.shape):
+                    print(f"[подія] {ev.human()}", flush=True)
+
             annotated = frame.copy()
+            if self.engine is not None:
+                draw_zones(annotated, self.engine.zones, self.engine.lines, self.engine)
             if self.history is not None:
                 draw_tracks(annotated, r.boxes, self.names, self.history,
                             show_trail=self.show_trail)
@@ -205,6 +218,9 @@ class DetectionPipeline:
             if self.history is not None:
                 self.stats.tracks_active = self.history.active
                 self.stats.tracks_total = self.history.total_seen
+            if self.engine is not None:
+                self.stats.occupancy = self.engine.occupancy()
+                self.stats.counters = dict(self.engine.counters)
             if self._summarize is not None:
                 counts: dict[str, int] = {}
                 for box in r.boxes:

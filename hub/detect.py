@@ -44,9 +44,10 @@ from pathlib import Path
 
 import cv2
 
-from camera import MjpegCamera, probe_status
+from camera import FileSource, MjpegCamera, probe_status
 from tracking import TrackHistory, draw_tracks
 from view import _poll_key, save_frame
+from zones import RuleEngine, draw_overlay as draw_zones, load_config as load_zones
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -138,7 +139,8 @@ def summarize(boxes, names) -> str:
     return ", ".join(f"{k} x{v}" for k, v in top)
 
 
-def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz, tracks=None):
+def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz,
+             tracks=None, rules=None):
     """Накладка: окремо FPS прийому, FPS показу і розклад часу інференсу."""
     pre = speed.get("preprocess", 0.0)
     inf = speed.get("inference", 0.0)
@@ -154,6 +156,9 @@ def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz, tracks=N
         # total росте тільки коли з'являється НОВИЙ ID. Якщо він біжить угору
         # при одній людині в кадрі — трекер губить трек і заводить новий
         lines.append(f"треків {tracks.active}   унікальних за сеанс {tracks.total_seen}")
+    if rules is not None and rules.counters:
+        top = sorted(rules.counters.items(), key=lambda kv: -kv[1])[:2]
+        lines.append("  ".join(f"{k} {v}" for k, v in top)[:44])
 
     pad, line_h, w = 8, 20, 340
     h = pad * 2 + line_h * len(lines)
@@ -171,6 +176,12 @@ def draw_hud(frame, *, recv_fps, show_fps, speed, summary, conf, imgsz, tracks=N
 def main() -> int:
     ap = argparse.ArgumentParser(description="Детекція людей у потоці з ESP32-S3 CAM")
     ap.add_argument("--url", default=DEFAULT_URL)
+    ap.add_argument("--source", help="прогнати по відеофайлу замість камери")
+    ap.add_argument("--loop", action="store_true", help="зациклити файл")
+    ap.add_argument("--fast", action="store_true",
+                    help="з --source: якнайшвидше замість реального темпу. "
+                         "УВАГА: трекер бачитиме рух прискореним, і його "
+                         "передбачення стануть гіршими — для замірів не годиться")
     ap.add_argument("--model", default=str(MODELS_DIR / "yolo11n.pt"),
                     help="файл ваг .pt, тека *_openvino_model, "
                          "або просто розмір входу: 320 / 640")
@@ -195,11 +206,20 @@ def main() -> int:
                          "botsort.yaml (точніший, але важчий: re-ID + "
                          "компенсація руху камери)")
     ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
+    ap.add_argument("--zones", nargs="?", const=str(PROJECT_ROOT / "docs" / "zones.json"),
+                    help="JSON із зонами й лініями (типово docs/zones.json). "
+                         "Вмикає трекінг автоматично: без стабільних ID правила "
+                         "не мають сенсу")
     ap.add_argument("--save-detections", action="store_true",
                     help="зберігати кадри, де знайдено людей, у captures/")
     ap.add_argument("--no-window", action="store_true")
     ap.add_argument("--seconds", type=float, default=0.0)
     args = ap.parse_args()
+
+    # Правила спираються на track_id: без стабільних ID «зайшов у зону»
+    # неможливо відрізнити від «досі стоїть у зоні». Тому вмикаємо трекінг самі.
+    if args.zones:
+        args.track = True
 
     # OpenVINO-модель експортується під ФІКСОВАНИЙ розмір входу — граф його
     # зашиває. Якщо модель задана скороченням (--model 320), imgsz має збігтися,
@@ -255,16 +275,31 @@ def main() -> int:
     classes = args.classes if args.classes else None
     print(f"[detect] класи: {'усі 80' if classes is None else [names[c] for c in classes]}")
 
-    st = probe_status(args.url)
+    st = probe_status(args.url) if not args.source else None
     if st and st.get("clients", 0) > 0:
         print(f"[detect] УВАГА: до потоку вже підключено {st['clients']} глядачів — "
               "вони ділять пропускну здатність")
 
     history = TrackHistory() if args.track else None
     if history is not None:
-        print(f"[detect] трекінг: {args.tracker}")
+        print(f"[detect] трекінг: {Path(args.tracker).name}")
 
-    cam = MjpegCamera(args.url)
+    engine = None
+    if args.zones:
+        zones_cfg, lines_cfg = load_zones(args.zones)
+        engine = RuleEngine(zones_cfg, lines_cfg)
+        print(f"[detect] правила з {args.zones}: "
+              f"зон {len(zones_cfg)}, ліній {len(lines_cfg)}")
+        if not zones_cfg and not lines_cfg:
+            print("[detect] конфіг порожній — намалюй зони: python hub/zone_editor.py")
+
+    if args.source:
+        cam = FileSource(args.source, realtime=not args.fast, loop=args.loop)
+        print(f"[detect] джерело: {args.source} "
+              f"({cam.frame_count} кадрів, {cam.fps:.0f} fps)")
+    else:
+        cam = MjpegCamera(args.url)
+
     show_fps, fps_t0, fps_n = 0.0, time.monotonic(), 0
     last_report, started = 0.0, time.monotonic()
     infer_ms_sum, infer_n = 0.0, 0
@@ -280,6 +315,10 @@ def main() -> int:
 
                 frame = cam.read(timeout=1.0)
                 if frame is None:
+                    # У файлу кадри закінчуються — на відміну від камери,
+                    # де None означає лише «поки що немає»
+                    if args.source and not cam.stats.connected:
+                        break
                     continue
 
                 # verbose=False — інакше ultralytics друкує рядок на КОЖЕН кадр
@@ -294,9 +333,16 @@ def main() -> int:
                 else:
                     r = model.predict(frame, **common)[0]
 
+                if engine is not None:
+                    for ev in engine.update(r.boxes, frame.shape):
+                        print(f"\n[подія] {ev.human()}")
+
                 # Малюємо по копії: у captures/ мають лежати чисті кадри,
                 # інакше ми навчимо майбутню модель на власних рамках
                 display = frame.copy()
+                if engine is not None:
+                    # зони під рамками, щоб заливка їх не притлумлювала
+                    draw_zones(display, engine.zones, engine.lines, engine)
                 if history is not None:
                     n_det = draw_tracks(display, r.boxes, names, history,
                                         show_trail=not args.no_trail)
@@ -325,7 +371,8 @@ def main() -> int:
                 else:
                     draw_hud(display, recv_fps=cam.stats.recv_fps, show_fps=show_fps,
                              speed=r.speed, summary=summarize(r.boxes, names),
-                             conf=args.conf, imgsz=args.imgsz, tracks=history)
+                             conf=args.conf, imgsz=args.imgsz, tracks=history,
+                             rules=engine)
                     cv2.imshow("YOLO — person detection", display)
 
                     key = _poll_key() & 0xFF
