@@ -1,7 +1,16 @@
 # VideoDetection
 
 Детекція людей і аналіз поведінки на відео з Freenove ESP32-S3-WROOM CAM.
-Повний план — [docs/PLAN.md](docs/PLAN.md).
+
+| Файл | Для чого |
+|------|----------|
+| [README.md](README.md) | опис проекту й інструкції запуску, **англійською** |
+| [firmware/esp32s3_cam/README.md](firmware/esp32s3_cam/README.md) | прошивка: ендпоінти, збірка, пінаут, траблшутинг |
+| [docs/PLAN.md](docs/PLAN.md) | план по етапах зі статусами |
+| [docs/benchmarks.md](docs/benchmarks.md) | усі заміри, включно з хибними гіпотезами |
+
+**Поточний стан:** етапи 0-4 закриті, етап 5 закритий крім детекції падіння,
+йде етап 6 (власний датасет і донавчання).
 
 ## Головне про цей проект
 
@@ -16,10 +25,25 @@
 
 ```
 firmware/esp32s3_cam/   PlatformIO-проект прошивки ESP32-S3 (MJPEG-сервер)
-hub/                    Python: прийом потоку, YOLO, веб-віддача, тренування
-docs/                   план, нотатки, результати бенчмарків
-models/                 ваги (у git не потрапляють)
-datasets/               датасети (у git не потрапляють)
+hub/                    Python: прийом потоку, YOLO, трекінг, правила, веб
+  camera.py             MjpegCamera (тримає лише останній кадр) + FileSource
+  view.py               перегляд сирого потоку, запис, збір кадрів
+  detect.py             детекція / трекінг / поза / зони у вікні
+  pipeline.py           єдиний конвеєр камера -> модель -> анотований кадр
+  server.py             хаб: HTTPS, токен, MJPEG-віддача, JSON API
+  tracking.py           TrackHistory: траєкторії, dwell, швидкість
+  zones.py              зони, лінії, рушій правил і подій
+  zone_editor.py        малювання зон мишею
+  pose.py               скелет COCO-17 і ознаки для правил
+  bench.py              бенчмарк бекендів і пристроїв
+  export.py             експорт моделей (openvino / ncnn / onnx)
+  make_cert.py          самопідписаний TLS з правильним SAN
+  track_quality.py      метрики трекінгу, перебір конфігурацій
+docs/                   план, заміри, пінаут, конфіг зон
+tests/                  геометрія зон без камери й моделі
+models/                 ваги й експортовані моделі (у git не потрапляють)
+secrets/                токен, сертифікат, ключ (у git не потрапляють)
+captures/               кадри для майбутнього датасету (у git не потрапляють)
 ```
 
 ## Залізо
@@ -61,6 +85,18 @@ C:\Users\Lenovo\.platformio\penv\Scripts\pio.exe device monitor -d firmware/esp3
 # просто подивитись потік / детекцію локально
 .venv\Scripts\python.exe hub\view.py
 .venv\Scripts\python.exe hub\detect.py --model 640 --device intel:gpu --classes
+
+# трекінг + поза + зони
+.venv\Scripts\python.exe hub\detect.py --model 640 --device intel:gpu --track --pose --zones
+
+# експорт моделей (перед першим запуском з --device intel:*)
+.venv\Scripts\python.exe hub\export.py
+
+# тести геометрії (не потребують камери)
+.venv\Scripts\python.exe tests\test_zones.py
+
+# прогін по запису замість камери — для порівнюваних замірів
+.venv\Scripts\python.exe hub\detect.py --source docs\track_test.mp4 --model 640 --device intel:gpu
 ```
 
 ## Хаб (етап 4)
@@ -107,3 +143,10 @@ C:\Users\Lenovo\.platformio\penv\Scripts\pio.exe device monitor -d firmware/esp3
 - Коментарі в коді — українською, пояснювальні, а не описові
   («чому саме так», а не «збільшуємо лічильник»).
 - Результати бенчмарків (FPS/точність) складаємо таблицями в `docs/`.
+- **Порівняння конфігурацій — лише на записаному ролику**, не наживо: у живих
+  прогонах людина рухається щоразу інакше, і різниця налаштувань тоне в цій
+  різниці. На цьому вже наступили при підборі трекера.
+- Хибні гіпотези в `docs/benchmarks.md` не видаляємо, а лишаємо з поясненням,
+  чому не спрацювали — двічі теоретично правильне міркування дало неправильний
+  висновок, і це найцінніше в цьому файлі.
+- README англійською, решта документації й коментарі — українською.

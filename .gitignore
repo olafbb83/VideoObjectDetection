@@ -19,5 +19,7 @@ models/*_ncnn_model/
 runs/
 datasets/
 captures/
+# локальні налаштування ultralytics: містять шляхи конкретної машини й uuid
+Ultralytics/
 *.mp4
 *.avi
