@@ -296,6 +296,9 @@ def main() -> int:
     ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
     ap.add_argument("--zones", nargs="?", const=str(PROJECT_ROOT / "docs" / "zones.json"),
                     help="JSON із зонами й лініями (типово docs/zones.json)")
+    ap.add_argument("--pose", action="store_true",
+                    help="скелет із 17 точок; підмінює модель детекції "
+                         "(лише клас person)")
     ap.add_argument("--http", action="store_true",
                     help="без TLS (тільки для локальної відладки)")
     args = ap.parse_args()
@@ -319,10 +322,11 @@ def main() -> int:
     from ultralytics import YOLO
     import uvicorn
 
-    model_path = resolve_model(args.model)
+    model_path = resolve_model(args.model, pose=args.pose)
     print(f"[hub] модель {model_path}")
+    task = "pose" if args.pose else "detect"
     is_ov = model_path.rstrip("/\\").endswith("_openvino_model")
-    model = YOLO(model_path, task="detect") if is_ov else YOLO(model_path)
+    model = YOLO(model_path, task=task) if is_ov else YOLO(model_path)
 
     engine = None
     if args.zones:
@@ -337,7 +341,7 @@ def main() -> int:
         device=args.device, jpeg_quality=args.jpeg_quality,
         draw_fn=draw_detections, summarize_fn=summarize,
         track=args.track, tracker=args.tracker, show_trail=not args.no_trail,
-        engine=engine,
+        engine=engine, pose=args.pose,
     ).start()
 
     scheme = "http" if args.http else "https"

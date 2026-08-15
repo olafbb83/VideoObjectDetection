@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import cv2
 
 from camera import MjpegCamera
+from pose import draw_pose
 from tracking import TrackHistory, draw_tracks
 from zones import RuleEngine, draw_overlay as draw_zones
 
@@ -87,6 +88,7 @@ class DetectionPipeline:
         tracker: str = "bytetrack.yaml",
         show_trail: bool = True,
         engine: RuleEngine | None = None,
+        pose: bool = False,
     ) -> None:
         self.cam = MjpegCamera(url)
         self.model = model
@@ -103,6 +105,7 @@ class DetectionPipeline:
         self.show_trail = show_trail
         self.history = TrackHistory() if track else None
         self.engine = engine
+        self.pose = pose
 
         self.stats = PipelineStats()
 
@@ -203,6 +206,8 @@ class DetectionPipeline:
             annotated = frame.copy()
             if self.engine is not None:
                 draw_zones(annotated, self.engine.zones, self.engine.lines, self.engine)
+            if self.pose:
+                draw_pose(annotated, r.keypoints)
             if self.history is not None:
                 draw_tracks(annotated, r.boxes, self.names, self.history,
                             show_trail=self.show_trail)

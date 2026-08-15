@@ -45,6 +45,7 @@ from pathlib import Path
 import cv2
 
 from camera import FileSource, MjpegCamera, probe_status
+from pose import draw_pose, pose_features_for
 from tracking import TrackHistory, draw_tracks
 from view import _poll_key, save_frame
 from zones import RuleEngine, draw_overlay as draw_zones, load_config as load_zones
@@ -78,24 +79,27 @@ def class_color(cls_id: int):
     return int(b), int(g), int(r)
 
 
-def resolve_model(path: str) -> str:
+def resolve_model(path: str, pose: bool = False) -> str:
     """
     Дозволяє передавати шлях до моделі відносно кореня проекту, а не поточної
     теки. Інакше `--model models/...` працює тільки якщо запускати скрипт
     саме з C:\\ESP_dev\\projects\\VideoDetection, що неочевидно і легко забути.
 
-    Також приймає скорочення: `--model 640` -> models/yolo11n_640_openvino_model
+    Скорочення: `--model 640` -> models/yolo11n_640_openvino_model,
+    а з --pose -> models/yolo11n-pose_640_openvino_model.
     """
     if path.isdigit():
-        return str(MODELS_DIR / f"yolo11n_{path}_openvino_model")
+        stem = "yolo11n-pose" if pose else "yolo11n"
+        return str(MODELS_DIR / f"{stem}_{path}_openvino_model")
 
     p = Path(path)
     if p.exists():
         return str(p)
 
-    candidate = PROJECT_ROOT / path
-    if candidate.exists():
-        return str(candidate)
+    for base in (PROJECT_ROOT, MODELS_DIR):
+        candidate = base / path
+        if candidate.exists():
+            return str(candidate)
 
     return path  # хай ultralytics сам скаже, чого саме не вистачає
 
@@ -182,9 +186,10 @@ def main() -> int:
                     help="з --source: якнайшвидше замість реального темпу. "
                          "УВАГА: трекер бачитиме рух прискореним, і його "
                          "передбачення стануть гіршими — для замірів не годиться")
-    ap.add_argument("--model", default=str(MODELS_DIR / "yolo11n.pt"),
-                    help="файл ваг .pt, тека *_openvino_model, "
-                         "або просто розмір входу: 320 / 640")
+    ap.add_argument("--model", default=None,
+                    help="файл ваг .pt, тека *_openvino_model, або просто "
+                         "розмір входу: 320 / 640. Типово yolo11n.pt, "
+                         "а з --pose — yolo11n-pose.pt")
     ap.add_argument("--device", default=None,
                     help="cpu | intel:cpu | intel:gpu | intel:npu (для OpenVINO)")
     ap.add_argument("--conf", type=float, default=None,
@@ -206,6 +211,14 @@ def main() -> int:
                          "botsort.yaml (точніший, але важчий: re-ID + "
                          "компенсація руху камери)")
     ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
+    ap.add_argument("--pose", action="store_true",
+                    help="скелет із 17 точок. ПІДМІНЮЄ модель детекції, а не "
+                         "додається до неї: yolo11n-pose сама детектує людей, "
+                         "запускати обидві означало б платити двічі. "
+                         "Наслідок: доступний лише клас person")
+    ap.add_argument("--pose-stats", action="store_true",
+                    help="друкувати ознаки пози (нахил тулуба, пропорції) — "
+                         "основа для правил падіння")
     ap.add_argument("--zones", nargs="?", const=str(PROJECT_ROOT / "docs" / "zones.json"),
                     help="JSON із зонами й лініями (типово docs/zones.json). "
                          "Вмикає трекінг автоматично: без стабільних ID правила "
@@ -220,6 +233,10 @@ def main() -> int:
     # неможливо відрізнити від «досі стоїть у зоні». Тому вмикаємо трекінг самі.
     if args.zones:
         args.track = True
+
+    # Типова модель залежить від режиму: pose має власні ваги
+    if args.model is None:
+        args.model = "yolo11n-pose.pt" if args.pose else "yolo11n.pt"
 
     # OpenVINO-модель експортується під ФІКСОВАНИЙ розмір входу — граф його
     # зашиває. Якщо модель задана скороченням (--model 320), imgsz має збігтися,
@@ -255,12 +272,29 @@ def main() -> int:
     from ultralytics import YOLO  # імпорт тут: він важкий, ~3 с
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = resolve_model(args.model)
+    model_path = resolve_model(args.model, pose=args.pose)
+
+    # Пристрої intel:* існують тільки в рантаймі OpenVINO. Якщо підсунути їх
+    # PyTorch-вагам, torch падає стектрейсом про «Invalid device string»,
+    # з якого зовсім не видно, що робити.
+    if (args.device or "").startswith("intel:") and not model_path.endswith("_openvino_model"):
+        size = args.imgsz
+        stem = "yolo11n-pose" if args.pose else "yolo11n"
+        print(f"[detect] --device {args.device} потребує моделі, експортованої "
+              f"в OpenVINO, а задано {Path(model_path).name}")
+        print(f"[detect] або додай --model {size}, або спершу експортуй:")
+        print(f"         python hub/export.py --task {'pose' if args.pose else 'detect'} "
+              f"--imgsz {size}")
+        print(f"[detect] очікувана тека: models/{stem}_{size}_openvino_model")
+        return 1
+
     print(f"[detect] завантажую модель {model_path}")
     # У теці OpenVINO немає метаданих про задачу — без явного task ultralytics
-    # лише вгадує її й сипле попередженням
+    # лише вгадує її й сипле попередженням. Для pose вгадування взагалі
+    # дало б "detect", і ключові точки просто не з'явились би.
+    task = "pose" if args.pose else "detect"
     is_ov = model_path.rstrip("/\\").endswith("_openvino_model")
-    model = YOLO(model_path, task="detect") if is_ov else YOLO(model_path)
+    model = YOLO(model_path, task=task) if is_ov else YOLO(model_path)
     names = model.names
 
     if args.list_classes:
@@ -302,6 +336,7 @@ def main() -> int:
 
     show_fps, fps_t0, fps_n = 0.0, time.monotonic(), 0
     last_report, started = 0.0, time.monotonic()
+    last_pose_print = 0.0
     infer_ms_sum, infer_n = 0.0, 0
 
     print("[detect] q — вихід, s — зберегти кадр")
@@ -337,12 +372,23 @@ def main() -> int:
                     for ev in engine.update(r.boxes, frame.shape):
                         print(f"\n[подія] {ev.human()}")
 
+                if args.pose and args.pose_stats and now - last_pose_print >= 1.0:
+                    for tid, pf in pose_features_for(r, frame.shape[0]).items():
+                        angle = ("—" if pf.torso_angle_deg is None
+                                 else f"{pf.torso_angle_deg:4.0f}°")
+                        print(f"\n[поза] #{tid}: тулуб {angle} від вертикалі | "
+                              f"пропорції {pf.aspect_ratio:.2f} | "
+                              f"точок видно {pf.visible}/17")
+                    last_pose_print = now
+
                 # Малюємо по копії: у captures/ мають лежати чисті кадри,
                 # інакше ми навчимо майбутню модель на власних рамках
                 display = frame.copy()
                 if engine is not None:
                     # зони під рамками, щоб заливка їх не притлумлювала
                     draw_zones(display, engine.zones, engine.lines, engine)
+                if args.pose:
+                    draw_pose(display, r.keypoints)
                 if history is not None:
                     n_det = draw_tracks(display, r.boxes, names, history,
                                         show_trail=not args.no_trail)

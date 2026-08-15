@@ -65,7 +65,7 @@ def collect_frames(url: str, n: int) -> list:
     return [f for f in frames if f is not None]
 
 
-def bench(model, frames, imgsz, device, warmup=5) -> dict:
+def bench(model, frames, imgsz, device, warmup=5) -> dict:  # noqa: D401
     """Прогін по кадрах. Повертає медіану й p95 часу інференсу в мс."""
     for f in frames[:warmup]:
         model.predict(f, imgsz=imgsz, device=device, classes=[0], verbose=False)
@@ -90,7 +90,8 @@ def bench(model, frames, imgsz, device, warmup=5) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Бенчмарк бекендів YOLO")
     ap.add_argument("--url", default=DEFAULT_URL)
-    ap.add_argument("--weights", default=str(MODELS_DIR / "yolo11n.pt"))
+    ap.add_argument("--task", nargs="+", default=["detect"], choices=["detect", "pose"],
+                    help="detect — рамки; pose — рамки + 17 точок скелета")
     ap.add_argument("--frames", type=int, default=60)
     ap.add_argument("--imgsz", type=int, nargs="+", default=[320, 640])
     ap.add_argument("--devices", nargs="+",
@@ -109,48 +110,43 @@ def main() -> int:
     h, w = frames[0].shape[:2]
     print(f"[bench] {len(frames)} кадрів {w}x{h}\n")
 
-    pt_model = YOLO(args.weights)
-
-    # Експорт в OpenVINO робиться під КОНКРЕТНИЙ imgsz: граф фіксує розмір
-    # входу, тож для 320 і 640 потрібні дві різні теки. Експорт кешуємо —
-    # він займає десятки секунд, а результат не змінюється.
-    ov_models: dict[int, object] = {}
-    if any(d.startswith("intel") for d in args.devices):
-        import shutil
-
-        for size in args.imgsz:
-            # Назва теки ОБОВ'ЯЗКОВО має закінчуватись на _openvino_model:
-            # ultralytics визначає формат моделі саме за суфіксом назви,
-            # а не за вмістом. Свою частину імені додаємо на початку.
-            target = MODELS_DIR / f"yolo11n_{size}_openvino_model"
-            if not target.exists():
-                print(f"[bench] експорт в OpenVINO для imgsz={size}...")
-                exported = Path(YOLO(args.weights).export(format="openvino", imgsz=size))
-                shutil.move(str(exported), str(target))
-            # task="detect" обов'язковий: у теці OpenVINO немає метаданих про
-            # задачу, і без підказки ultralytics лише вгадує її з попередженням
-            ov_models[size] = YOLO(str(target), task="detect")
+    from export import WEIGHTS, export_one
 
     rows = []
-    for size in args.imgsz:
-        for device in args.devices:
-            model = pt_model if device == "cpu" else ov_models.get(size)
-            backend = "PyTorch" if device == "cpu" else "OpenVINO"
-            if model is None:
-                continue
-            try:
-                res = bench(model, frames, size, device)
-                rows.append((backend, device, size, res))
-                print(f"  {backend:9s} {device:10s} imgsz {size}: "
-                      f"{res['median_ms']:6.1f} ms  ({res['fps']:5.1f} fps)")
-            except Exception as exc:
-                print(f"  {backend:9s} {device:10s} imgsz {size}: НЕДОСТУПНО "
-                      f"({type(exc).__name__}: {str(exc)[:70]})")
+    for task in args.task:
+        pt_weights = MODELS_DIR / WEIGHTS[task]
+        pt_model = YOLO(str(pt_weights))
 
-    print("\n" + "-" * 62)
-    print(f"{'бекенд':10s} {'пристрій':11s} {'imgsz':>6s} {'median':>9s} {'p95':>8s} {'fps':>7s}")
-    for backend, device, size, r in rows:
-        print(f"{backend:10s} {device:11s} {size:6d} "
+        # Експорт під КОНКРЕТНИЙ imgsz: граф фіксує розмір входу, тож для 320
+        # і 640 потрібні різні теки. export_one кешує — результат не змінюється.
+        ov_models: dict[int, object] = {}
+        if any(d.startswith("intel") for d in args.devices):
+            for size in args.imgsz:
+                target = export_one(task, size, "openvino", force=False)
+                # task обов'язковий: у теці OpenVINO немає метаданих про задачу.
+                # Для pose вгадування дало б "detect", і точки просто зникли б.
+                ov_models[size] = YOLO(str(target), task=task)
+
+        for size in args.imgsz:
+            for device in args.devices:
+                model = pt_model if device == "cpu" else ov_models.get(size)
+                backend = "PyTorch" if device == "cpu" else "OpenVINO"
+                if model is None:
+                    continue
+                try:
+                    res = bench(model, frames, size, device)
+                    rows.append((task, backend, device, size, res))
+                    print(f"  {task:7s} {backend:9s} {device:10s} imgsz {size}: "
+                          f"{res['median_ms']:6.1f} ms  ({res['fps']:5.1f} fps)")
+                except Exception as exc:
+                    print(f"  {task:7s} {backend:9s} {device:10s} imgsz {size}: "
+                          f"НЕДОСТУПНО ({type(exc).__name__}: {str(exc)[:60]})")
+
+    print("\n" + "-" * 72)
+    print(f"{'задача':8s} {'бекенд':10s} {'пристрій':11s} {'imgsz':>6s} "
+          f"{'median':>9s} {'p95':>8s} {'fps':>7s}")
+    for task, backend, device, size, r in rows:
+        print(f"{task:8s} {backend:10s} {device:11s} {size:6d} "
               f"{r['median_ms']:8.1f}м {r['p95_ms']:7.1f}м {r['fps']:7.1f}")
 
     return 0
