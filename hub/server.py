@@ -234,9 +234,7 @@ def main() -> int:
     ap.add_argument("--url", default=os.environ.get("CAM_URL", "http://esp32cam.local:81/stream"))
     ap.add_argument("--model", default="640", help="шлях до моделі або 320 / 640")
     ap.add_argument("--device", default=None, help="cpu | intel:gpu | intel:npu")
-    ap.add_argument("--conf", type=float, default=None,
-                    help="типово 0.35; з --track 0.1 (трекер працює після NMS, "
-                         "тож слабкі детекції треба до нього пропустити)")
+    ap.add_argument("--conf", type=float, default=0.35)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--imgsz", type=int, default=None)
     ap.add_argument("--classes", type=int, nargs="*", default=[0])
@@ -253,11 +251,6 @@ def main() -> int:
 
     if args.imgsz is None:
         args.imgsz = int(args.model) if args.model.isdigit() else 640
-
-    # Див. пояснення в detect.py: ByteTrack розрахований на слабкі детекції,
-    # а conf відсікає їх ще до трекера
-    if args.conf is None:
-        args.conf = 0.1 if args.track else 0.35
 
     if not args.http and not (CERT_PATH.exists() and KEY_PATH.exists()):
         print(f"[hub] немає сертифіката {CERT_PATH}")

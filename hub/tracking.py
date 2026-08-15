@@ -78,8 +78,15 @@ class TrackHistory:
         self.tracks: dict[int, Track] = {}
         self.total_seen = 0  # скільки унікальних об'єктів пройшло за весь час
 
-    def update(self, boxes, names) -> None:
-        now = time.monotonic()
+    def update(self, boxes, names, now: float | None = None) -> None:
+        """
+        now можна задати явно — це потрібно для прогонів по записаному файлу.
+        Там кадри обробляються швидше за реальний час, і time.monotonic()
+        показав би тривалість треків у рази меншою, ніж вона була насправді.
+        Для файлу передавай номер_кадру / fps.
+        """
+        if now is None:
+            now = time.monotonic()
 
         for box in boxes:
             if box.id is None:  # детекція без треку — трекер її ще не прийняв
