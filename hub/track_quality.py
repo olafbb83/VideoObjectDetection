@@ -42,11 +42,14 @@ import cv2
 import yaml
 
 from camera import MjpegCamera
-from detect import resolve_model
+from detect import TUNED_TRACKER, resolve_model
 from tracking import TrackHistory
 
 DEFAULT_URL = os.environ.get("CAM_URL", "http://esp32cam.local:81/stream")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Для нормування метрики. Збігається з тим, що пише view.py --record.
+FPS_ASSUMED = 25.0
 
 
 def frames_from_file(path: str):
@@ -85,7 +88,11 @@ def tracker_config(base: str, overrides: dict) -> str:
 
     import ultralytics
 
-    base_path = Path(ultralytics.__file__).parent / "cfg" / "trackers" / base
+    # base може бути як назвою стокового конфіга, так і шляхом до нашого
+    base_path = Path(base)
+    if not base_path.exists():
+        base_path = Path(ultralytics.__file__).parent / "cfg" / "trackers" / base
+
     cfg = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     cfg = copy.deepcopy(cfg)
     cfg.update(overrides)
@@ -127,9 +134,27 @@ def run(model, frames, *, conf, imgsz, device, tracker_path, label):
     mean_life = statistics.mean(finished) if finished else 0.0
     med_life = statistics.median(finished) if finished else 0.0
 
-    print(f"{label:<34s} {n:5d} {n_with / max(n, 1):6.0%} "
-          f"{history.total_seen:6d} {mean_life:8.1f} {med_life:8.1f}")
-    return {"ids": history.total_seen, "mean": mean_life, "median": med_life}
+    coverage = n_with / max(n, 1)
+
+    # Головна метрика — розривів на секунду ПРИСУТНОСТІ людини, а не всього.
+    #
+    # Просто мінімізувати кількість ID не можна: за такою логікою найкраща
+    # конфігурація та, що взагалі нічого не детектує (нуль детекцій — нуль
+    # розривів). Нормування на час, коли людина реально була в кадрі, прибирає
+    # цю лазівку: конфігурація, яка «виграє» пропусканням детекцій, втрачає
+    # знаменник разом із чисельником і нічого не виграє.
+    person_seconds = n_with / FPS_ASSUMED
+    ids_per_s = history.total_seen / person_seconds if person_seconds > 0 else 0.0
+
+    print(f"{label:<34s} {n:5d} {coverage:6.0%} "
+          f"{history.total_seen:6d} {mean_life:8.1f} {med_life:8.1f} {ids_per_s:9.2f}")
+    return {
+        "ids": history.total_seen,
+        "mean": mean_life,
+        "median": med_life,
+        "coverage": coverage,
+        "ids_per_s": ids_per_s,
+    }
 
 
 def main() -> int:
@@ -140,10 +165,16 @@ def main() -> int:
     ap.add_argument("--model", default="640")
     ap.add_argument("--device", default="intel:gpu")
     ap.add_argument("--imgsz", type=int, default=None)
-    ap.add_argument("--conf", type=float, default=0.35)
-    ap.add_argument("--tracker", default="bytetrack.yaml")
+    ap.add_argument("--conf", type=float, default=0.45)
+    ap.add_argument("--tracker", default=str(TUNED_TRACKER))
     ap.add_argument("--sweep", action="store_true",
                     help="прогнати набір конфігурацій на тому самому вході")
+    ap.add_argument("--sweep-set", default="base", choices=["base", "combo"],
+                    help="base — окремі параметри; combo — комбінації переможців")
+    ap.add_argument("--sweep-base", default="bytetrack.yaml",
+                    help="від якого конфіга відштовхуються перебори. Типово "
+                         "СТОКОВИЙ bytetrack.yaml, щоб результати лишались "
+                         "відтворюваними після підкрутки нашого власного")
     args = ap.parse_args()
 
     if args.imgsz is None:
@@ -166,8 +197,8 @@ def main() -> int:
         return frames_from_camera(args.url, args.seconds)
 
     print(f"\n{'конфігурація':<34s} {'кадрів':>5s} {'з люд.':>6s} "
-          f"{'ID':>6s} {'сер.с':>8s} {'мед.с':>8s}")
-    print("-" * 72)
+          f"{'ID':>6s} {'сер.с':>8s} {'мед.с':>8s} {'ID/с':>9s}")
+    print("-" * 82)
 
     if not args.sweep:
         if not args.source:
@@ -178,28 +209,49 @@ def main() -> int:
         return 0
 
     # Набір гіпотез. track_buffer — скільки кадрів пам'ятати втрачений трек
-    # (30 ≈ 1.2 с при 25 fps). match_thresh — наскільки суворо зіставляти.
-    configs = [
-        ("базова (conf 0.35)", 0.35, {}),
-        ("conf 0.25", 0.25, {}),
-        ("conf 0.50", 0.50, {}),
-        ("buffer 60 (2.4 c)", 0.35, {"track_buffer": 60}),
-        ("buffer 90 (3.6 c)", 0.35, {"track_buffer": 90}),
-        ("buffer 90 + match 0.9", 0.35, {"track_buffer": 90, "match_thresh": 0.9}),
-        ("buffer 90 + new_thresh 0.5", 0.35, {"track_buffer": 90, "new_track_thresh": 0.5}),
-    ]
+    # (30 ≈ 1.2 с при 25 fps). match_thresh — наскільки СУВОРО зіставляти:
+    # більше значення = трекер приймає гірший збіг замість заведення нового ID.
+    SWEEPS = {
+        "base": [
+            ("базова (conf 0.35)", 0.35, {}),
+            ("conf 0.25", 0.25, {}),
+            ("conf 0.50", 0.50, {}),
+            ("buffer 60 (2.4 c)", 0.35, {"track_buffer": 60}),
+            ("buffer 90 (3.6 c)", 0.35, {"track_buffer": 90}),
+            ("buffer 90 + match 0.9", 0.35, {"track_buffer": 90, "match_thresh": 0.9}),
+            ("buffer 90 + new_thresh 0.5", 0.35, {"track_buffer": 90, "new_track_thresh": 0.5}),
+        ],
+        # Комбінації переможців першого раунду: conf 0.50 дав найдовші треки,
+        # match_thresh 0.9 — найкращу медіану. Разом їх ще не перевіряли.
+        "combo": [
+            ("базова (conf 0.35)", 0.35, {}),
+            ("conf 0.50", 0.50, {}),
+            ("match 0.9", 0.35, {"match_thresh": 0.9}),
+            ("conf 0.50 + match 0.9", 0.50, {"match_thresh": 0.9}),
+            ("conf 0.50 + match 0.95", 0.50, {"match_thresh": 0.95}),
+            ("conf 0.50 + match 0.9 + buf 90", 0.50, {"match_thresh": 0.9, "track_buffer": 90}),
+            ("conf 0.45 + match 0.9 + new 0.5", 0.45,
+             {"match_thresh": 0.9, "new_track_thresh": 0.5}),
+            ("conf 0.60 + match 0.9", 0.60, {"match_thresh": 0.9}),
+        ],
+    }
+    configs = SWEEPS[args.sweep_set]
 
     results = []
     for label, conf, overrides in configs:
-        path = tracker_config(args.tracker, overrides)
+        path = tracker_config(args.sweep_base, overrides)
         res = run(model, make_frames(), conf=conf, imgsz=args.imgsz,
                   device=args.device, tracker_path=path, label=label)
         results.append((label, res))
 
-    print("-" * 72)
-    best = min(results, key=lambda kv: (kv[1]["ids"], -kv[1]["mean"]))
-    print(f"\nнайменше розривів: {best[0]}  "
-          f"({best[1]['ids']} ID, треки живуть у середньому {best[1]['mean']:.1f} с)")
+    print("-" * 82)
+    best = min(results, key=lambda kv: kv[1]["ids_per_s"])
+    b = best[1]
+    print(f"\nнайменше розривів на секунду присутності: {best[0]}")
+    print(f"   {b['ids_per_s']:.2f} ID/с | покриття {b['coverage']:.0%} | "
+          f"треки живуть у середньому {b['mean']:.1f} с (медіана {b['median']:.1f} с)")
+    print("\nЗвіряй з покриттям: конфігурація може «виграти» просто тим, що")
+    print("детектує менше людей. Падіння покриття — це втрачені кадри.")
     return 0
 
 

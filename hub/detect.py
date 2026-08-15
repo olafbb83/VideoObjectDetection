@@ -50,6 +50,7 @@ from view import _poll_key, save_frame
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
+TUNED_TRACKER = Path(__file__).resolve().parent / "trackers" / "bytetrack_tuned.yaml"
 
 DEFAULT_URL = os.environ.get("CAM_URL", "http://esp32cam.local:81/stream")
 
@@ -188,10 +189,11 @@ def main() -> int:
                     help="показати всі класи, які модель уміє розпізнавати, і вийти")
     ap.add_argument("--track", action="store_true",
                     help="увімкнути трекінг: стабільні ID, хвости траєкторій, час у кадрі")
-    ap.add_argument("--tracker", default="bytetrack.yaml",
-                    choices=["bytetrack.yaml", "botsort.yaml"],
-                    help="bytetrack — легкий і швидкий; botsort — точніший, "
-                         "але важчий (re-ID + компенсація руху камери)")
+    ap.add_argument("--tracker", default=str(TUNED_TRACKER),
+                    help="типово наш підібраний bytetrack_tuned.yaml. "
+                         "Для порівняння: bytetrack.yaml (стоковий) або "
+                         "botsort.yaml (точніший, але важчий: re-ID + "
+                         "компенсація руху камери)")
     ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
     ap.add_argument("--save-detections", action="store_true",
                     help="зберігати кадри, де знайдено людей, у captures/")
@@ -214,16 +216,21 @@ def main() -> int:
     # детекцій (track_low_thresh 0.1) — здавалося б, поріг треба знизити,
     # щоб другий прохід зіставлення взагалі отримав вхід.
     #
-    # Замір на цій камері (60 с, одна людина, docs/benchmarks.md):
-    #   conf 0.35 -> 3 ID,  середня тривалість треку 19.7 с
-    #   conf 0.10 -> 14 ID, середня тривалість треку  4.4 с
+    # Замір на записі docs/track_test.mp4 (883 кадри, docs/benchmarks.md):
+    #   conf 0.10 -> 14 ID (наживо), треки рвуться щосекунди
+    #   conf 0.35 -> 18 ID, медіана треку 0.7 с
+    #   conf 0.45 + tuned tracker -> 6 ID, медіана 3.9 с
     #
-    # Причина: слабкі детекції тут — переважно сміття, а не затулена людина.
-    # Трек зповзає на сміття, справжня людина перестає з ним зіставлятись,
-    # заводиться новий ID. У самому bytetrack.yaml це названо «recovery vs
-    # drift»: на чистому відео виграє recovery, на шумному — drift.
+    # Причина, чому низький поріг шкодить: слабкі детекції тут переважно
+    # сміття, а не затулена людина. Трек зповзає на сміття, справжня людина
+    # перестає з ним зіставлятись, заводиться новий ID. У bytetrack.yaml це
+    # названо «recovery vs drift»: на чистому відео виграє recovery,
+    # на шумному — drift.
+    #
+    # Для трекінгу поріг вищий (0.45), бо там ціна хибної детекції — розрив
+    # треку. Для чистої детекції лишаємо 0.35: краще покриття кадрів.
     if args.conf is None:
-        args.conf = 0.35
+        args.conf = 0.45 if args.track else 0.35
 
     from ultralytics import YOLO  # імпорт тут: він важкий, ~3 с
 

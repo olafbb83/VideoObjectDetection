@@ -36,7 +36,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from detect import draw_detections, resolve_model, summarize
+from detect import TUNED_TRACKER, draw_detections, resolve_model, summarize
 from pipeline import DetectionPipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -234,7 +234,9 @@ def main() -> int:
     ap.add_argument("--url", default=os.environ.get("CAM_URL", "http://esp32cam.local:81/stream"))
     ap.add_argument("--model", default="640", help="шлях до моделі або 320 / 640")
     ap.add_argument("--device", default=None, help="cpu | intel:gpu | intel:npu")
-    ap.add_argument("--conf", type=float, default=0.35)
+    ap.add_argument("--conf", type=float, default=None,
+                    help="типово 0.35, з --track 0.45 (див. detect.py: вища "
+                         "планка менше рве треки)")
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--imgsz", type=int, default=None)
     ap.add_argument("--classes", type=int, nargs="*", default=[0])
@@ -242,8 +244,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--jpeg-quality", type=int, default=80)
     ap.add_argument("--track", action="store_true", help="увімкнути трекінг зі стабільними ID")
-    ap.add_argument("--tracker", default="bytetrack.yaml",
-                    choices=["bytetrack.yaml", "botsort.yaml"])
+    ap.add_argument("--tracker", default=str(TUNED_TRACKER))
     ap.add_argument("--no-trail", action="store_true", help="не малювати хвости траєкторій")
     ap.add_argument("--http", action="store_true",
                     help="без TLS (тільки для локальної відладки)")
@@ -251,6 +252,8 @@ def main() -> int:
 
     if args.imgsz is None:
         args.imgsz = int(args.model) if args.model.isdigit() else 640
+    if args.conf is None:
+        args.conf = 0.45 if args.track else 0.35
 
     if not args.http and not (CERT_PATH.exists() and KEY_PATH.exists()):
         print(f"[hub] немає сертифіката {CERT_PATH}")
