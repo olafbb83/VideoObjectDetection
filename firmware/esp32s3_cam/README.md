@@ -3,7 +3,8 @@
 MJPEG streaming firmware for the **Freenove ESP32-S3-WROOM CAM**, built with
 PlatformIO and the Arduino framework. The camera module is interchangeable
 (OV2640, OV3660, OV5640): the sensor is detected at boot and configured from a
-per-sensor profile. The board currently runs an **OV5640**.
+per-sensor profile. The stock module shipped with the board is an **OV3660**;
+an OV5640 and two OV2640 modules were added later.
 
 The board does one job: capture frames and push them over Wi-Fi. All inference
 happens on the hub — see the [project README](../../README.md).
@@ -29,7 +30,8 @@ without knowing the IP.
 
 The camera connector accepts several interchangeable modules. They are
 electrically compatible, but their best settings differ. This was learned the
-hard way: an OV5640 running on OV2640 settings produced fixed vertical stripes
+hard way: an OV5640 running on the settings that worked for the first module
+(OV3660) produced fixed vertical stripes
 across the whole frame and JPEG frames three times heavier (36–40 KB instead of
 9–14 KB).
 
@@ -38,8 +40,8 @@ sensor's PID and picks a profile (`PROFILES` in `src/main.cpp`):
 
 | Sensor | XCLK | Mirror / flip | Confidence |
 |--------|------|---------------|------------|
-| OV2640 | 20 MHz | 1 / 1 | measured: VGA 29–34 fps |
-| OV3660 | 20 MHz | 1 / 0 | taken from Freenove's example, untested here |
+| OV2640 | 20 MHz | 1 / 1 | measured: no stripes in light or dark at any XCLK; VGA 21–24 fps at 20 MHz; orientation confirmed on this board |
+| OV3660 | 20 MHz | 0 / 1 | stock module shipped with the board; measured in stages 1–5: VGA 29–34 fps; orientation confirmed on this board (stage 1–5 frames were most likely mirrored left–right) |
 | OV5640 | 8 MHz at boot, **adaptive 16 / 8** | 1 / 0 | measured: 8 MHz clean in light and dark; adaptive thresholds calibrated; orientation confirmed on this board |
 | unknown | 10 MHz | 1 / 0 | conservative fallback |
 
@@ -50,9 +52,17 @@ own settings. `/status` reports `sensor`, `pid` and `profile` (`default` or
 `saved`), and because `hub/collect.py` stores `/status` with every dataset
 session, it is always known which sensor captured which frames.
 
+**Caveat: settings are keyed by sensor PID, not by physical module.** Two
+modules with the same sensor share one set of saved settings, and `/save` on one
+overwrites the other. This board has two OV2640 modules — #1 and #2, an
+HDF3M-811 mounted rotated 180° relative to #1 — so after swapping between
+them the orientation has to be corrected again. There is no module-level ID the
+firmware could read to tell them apart, which also means dataset metadata
+records the sensor, not which of the two OV2640 modules took the frames.
+
 **The XCLK chicken-and-egg problem.** XCLK must be set *before* the camera is
 initialised, but the PID is only known *after*. The firmware therefore boots at
-20 MHz (both OV2640 and OV5640 come up fine there — reading the PID goes over
+20 MHz (both OV3660 and OV5640 come up fine there — reading the PID goes over
 SCCB, which is unaffected by the stripes on the parallel data bus), reads the
 PID, and if the profile wants a different frequency it calls
 `esp_camera_deinit()` and initialises again. `/control?var=xclk` changes the
@@ -158,7 +168,7 @@ problems from the Python side.
   `PANIC` / `TASK_WDT` means the firmware crashed or hung — fix the code.
   `POWERON` / `EXT_PIN` is a normal start or the reset button.
 * **`clients`** is the number of viewers currently attached to the stream.
-  On the OV2640 at 30 fps two clients shared the bandwidth (13.3 + 7.4 fps where
+  On the OV3660 at 30 fps two clients shared the bandwidth (13.3 + 7.4 fps where
   a single one got 21). On the OV5640 a second client once received **no frames
   at all** while a browser tab was open. Not investigated separately — close
   other viewers before measuring.
@@ -313,9 +323,33 @@ indefinitely. The Python client repeats the same pattern on its side.
 
 ## Measured performance
 
-### OV5640 (current module)
+All measurements in this section: same room, same camera position,
+`hub/camera_tune.py`, VGA, JPEG quality 12, single client. "Light" is the room
+lamp on, "dark" is the evening without it. The PID of every module was taken
+from the boot log.
 
-VGA, JPEG quality 12, single client, `hub/camera_tune.py`:
+Run-to-run spread is ~5–10% for both fps and the stripe score, so smaller
+differences are not meaningful. The stripe score is relative: compare light vs
+dark within one module, not scores across modules with different fields of view.
+
+### Summary: four modules
+
+| Module (PID) | fps @20 MHz, light | fps @20 MHz, dark | fps @8 MHz, light / dark | Stripes in the dark @20 MHz | Field of view |
+|--------------|-------------------:|------------------:|-------------------------:|-----------------------------|---------------|
+| OV3660, stock (0x3660) | **26.1** | **24.9** | 10.8 / 10.9 | none | narrow |
+| OV2640 #1 (0x0026) | 21.3–22.7 | 23.5 | 9.9 / 10.0 | none | wide |
+| OV2640 #2, HDF3M-811 (0x0026) | 19.4 | 22.1 | 9.8 / 8.4 | none | narrow |
+| OV5640 (0x5640) | 18.1 | 7.4 | 8.7 / 8.7 | **frame nearly destroyed** | wide |
+
+- **Only the OV5640 shows stripes in the dark** at high XCLK. Board, bus and
+  firmware are identical, so the problem belongs to that module, not the ESP32.
+- **On every module the frame rate is set by the sensor clock**, not by Wi-Fi
+  or JPEG size.
+- **A lower frame rate brightens night images on every module** — a longer frame
+  collects more light. This is independent of the stripes.
+- **For night use without the adaptive mode the OV3660 is the best of the four.**
+
+### OV5640
 
 | XCLK | fps, light | fps, dark | KB/frame, light | KB/frame, dark | stripes, light | stripes, dark |
 |-----:|-----------:|----------:|----------------:|---------------:|---------------:|--------------:|
@@ -325,11 +359,77 @@ VGA, JPEG quality 12, single client, `hub/camera_tune.py`:
 | 10 | 10.8 | 9.1 | 15.5 | 15.6 | 0.93 | 1.07 |
 | 8 | 8.7 | 8.7 | 15.5 | 15.6 | 0.90 | 0.98 |
 
-The stripe score is relative (compare rows, not against zero); checked by eye:
-11.17 is a nearly destroyed frame, 1.76 faint stripes on a plain wall, 0.98 clean.
-Noise does not compress, which is why dark frames at high XCLK are so heavy.
+Checked by eye: 11.17 is a nearly destroyed frame, 1.76 faint stripes on a plain
+wall, 0.98 clean. Noise does not compress, which is why dark frames at high XCLK
+are so heavy.
 
-### OV2640 (previous module)
+### OV2640 #1
+
+Orientation 1 / 1 confirmed on this board. Wide field of view.
+
+| XCLK | fps, light | fps, dark | KB/frame, light | KB/frame, dark | stripes, light | stripes, dark |
+|-----:|-----------:|----------:|----------------:|---------------:|---------------:|--------------:|
+| 20 | 21.3 | 23.5 | 15.0 | 10.7 | 0.71 | 0.56 |
+| 16 | 15.6 | 19.1 | 14.9 | 11.2 | 0.74 | 0.56 |
+| 12 | 13.2 | 12.6 | 14.8 | 11.3 | 0.74 | 0.53 |
+| 10 | 12.4 | 12.1 | 14.7 | 11.9 | 0.79 | 0.52 |
+| 8 | 9.9 | 10.0 | 14.9 | 12.4 | 0.77 | 0.50 |
+
+- **No stripes in the dark** at any frequency.
+- **JPEG size does not limit fps even at 20 MHz:** quality 10 → 20 shrinks frames
+  by 28% while fps changes by 5%.
+- **In the dark, fps at 20 and 16 MHz was higher than in light.** The second
+  OV2640 module reproduced this (+10…22% across both), so it looks like genuine
+  OV2640 behaviour. Cause unknown: JPEG size is ruled out, a mains-flicker banding
+  filter is an untested candidate.
+- An apparently stepped fps curve on this module did not reproduce on the second
+  one and is attributed to run-to-run spread.
+- **In the dark, frames grow as XCLK falls** (10.7 → 12.4 KB): the longer exposure
+  brightens the scene and reveals detail. Lower stripe scores in the dark reflect
+  a different scene (ceiling lamp off), not a better sensor.
+
+### OV2640 #2, HDF3M-811
+
+The seller's sensor claim holds (PID `0x0026`), but the module is **not**
+wide-angle: its field of view is narrower than OV2640 #1's. The image
+is softer and lower in contrast. Mounted rotated 180° relative to OV2640 #1,
+so it needs orientation 0 / 0 — see the caveat on shared settings above.
+
+| XCLK | fps, light | fps, dark | KB/frame, light | KB/frame, dark | stripes, light | stripes, dark |
+|-----:|-----------:|----------:|----------------:|---------------:|---------------:|--------------:|
+| 20 | 19.4 | 22.1 | 14.6 | 10.6 | 1.55 | 0.31 |
+| 16 | 15.4 | 18.4 | 14.8 | 10.9 | 1.54 | 0.31 |
+| 12 | 14.8 | 14.6 | 14.7 | 11.2 | 1.53 | 0.31 |
+| 10 | 12.1 | 11.9 | 14.6 | 11.4 | 1.55 | 0.32 |
+| 8 | 9.8 | 8.4 | 14.6 | 12.1 | 1.52 | 0.37 |
+
+No stripes in the dark. The high stripe scores in light come from sharp vertical
+edges in this framing (window frame, blind, cord) and do not depend on XCLK.
+
+### OV3660 — same room, same tool
+
+PID `0x3660` confirmed from the boot log. Its field of view is narrower than the
+OV5640's, so compare light vs dark within one module rather than stripe scores
+across modules.
+
+| XCLK | fps, light | fps, dark | KB/frame, light | KB/frame, dark | stripes, light | stripes, dark |
+|-----:|-----------:|----------:|----------------:|---------------:|---------------:|--------------:|
+| 20 | 26.1 | 24.9 | 13.2 | 16.0 | 0.63 | 0.70 |
+| 16 | 21.7 | 21.2 | 13.2 | 15.8 | 0.63 | 0.70 |
+| 12 | 16.8 | 16.7 | 13.2 | 15.0 | 0.64 | 0.72 |
+| 10 | 13.7 | 13.6 | 13.1 | 11.0 | 0.64 | 0.70 |
+| 8 | 10.8 | 10.9 | 13.1 | 10.4 | 0.65 | 0.70 |
+
+**No stripes in the dark at any frequency** — unlike the OV5640 on the same
+board, bus and firmware, so the dark × high-XCLK problem belongs to that module,
+not to the ESP32. The OV3660 keeps ~25 fps at 20 MHz at night. Frames at 20 MHz
+are still visibly darker than at 8 MHz: a shorter frame collects less light, so
+a lower frame rate brightens night images on any sensor.
+
+### OV3660 (stages 1–5)
+
+Earlier revisions of this document called this module an OV2640 — the name
+came from vendor documentation and the PID was never checked in the boot log.
 
 VGA, JPEG quality 12, XCLK 20 MHz, single client:
 
@@ -339,7 +439,7 @@ VGA, JPEG quality 12, XCLK 20 MHz, single client:
 | SVGA | 800×600 | 29 | — |
 | HD | 1280×720 | 16–18 | — |
 
-VGA and SVGA both hit the OV2640's ~30 fps ceiling, so neither the ESP32 nor
+VGA and SVGA both hit the OV3660's ~30 fps ceiling, so neither the ESP32 nor
 Wi-Fi is the limit there. HD halves it because the larger frame no longer fits
 through the sensor's DVP bus and the network in time.
 

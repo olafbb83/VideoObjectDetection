@@ -1,6 +1,7 @@
 #pragma once
 //
-// Розводка камери OV2640 на платі Freenove ESP32-S3-WROOM.
+// Розводка роз'єму камери на платі Freenove ESP32-S3-WROOM — спільна для
+// модулів OV2640 / OV3660 / OV5640 (на цій платі перевірено OV3660 і OV5640).
 // Збігається з профілем CAMERA_MODEL_ESP32S3_EYE з офіційного прикладу Freenove
 // (Sketch_32.1_CameraWebServer) і з пінаутом S3CamWroom1.png у корені проекту.
 //

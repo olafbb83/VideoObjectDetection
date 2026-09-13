@@ -37,7 +37,7 @@ three simultaneous viewers get 19.7 / 19.9 / 19.8 fps and the model runs once.
 
 | Device | Role | Measured performance |
 |--------|------|----------------------|
-| Freenove ESP32-S3-WROOM CAM (OV2640) | video source | VGA 640×480 ≈ 30 fps, SVGA ≈ 29, HD 1280×720 ≈ 17 |
+| Freenove ESP32-S3-WROOM CAM, interchangeable camera modules | video source | VGA at 20 MHz, light / dark: OV3660 (stock module) 26 / 25 fps; OV2640 (two modules) 19–23 / 22–24 fps; OV5640 18 / 7 fps with stripes in the dark, hence adaptive XCLK (≈16 fps in light, 8.7 in the dark). Four-module comparison in [docs/benchmarks.md](docs/benchmarks.md) |
 | Intel Core Ultra 7 155H, 32 GB | development, training, inference | YOLO11n @640 on iGPU: 14.3 ms (70 fps) |
 | Raspberry Pi 5, 8 GB | target 24/7 deployment | not yet deployed (stage 7) |
 
@@ -137,6 +137,7 @@ The server prints a ready-to-open URL containing the token.
 | `hub/make_cert.py` | self-signed TLS certificate with correct SAN entries |
 | `hub/zone_editor.py` | draw zones and lines with the mouse over a real frame |
 | `hub/track_quality.py` | measure tracking quality; sweep tracker configurations |
+| `hub/camera_tune.py` | sweep XCLK × JPEG quality: fps, frame size, stripe score, auto-exposure state |
 | `tests/test_zones.py` | zone/line geometry tests — no camera, no model |
 
 ### Useful flags of `hub/detect.py`
@@ -197,7 +198,7 @@ Custom firmware serving MJPEG on port 81, plus telemetry on port 80. The stream
 handler blocks forever, so it lives on a separate HTTP server; otherwise
 `/status` and `/control` would stop responding while streaming.
 
-Measured: VGA 29–34 fps, SVGA 29, HD 16–18. VGA and SVGA both hit the OV2640
+Measured: VGA 29–34 fps, SVGA 29, HD 16–18. VGA and SVGA both hit the OV3660
 sensor's ~30 fps ceiling — neither Wi-Fi nor the ESP32 is the bottleneck.
 **VGA is the working mode**: SVGA is equally fast but produces heavier frames,
 and YOLO resizes everything to 640 anyway.
